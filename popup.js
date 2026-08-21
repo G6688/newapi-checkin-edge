@@ -85,10 +85,15 @@ function validatePlatform(p) {
   }
   if (url.protocol !== "https:" && url.protocol !== "http:")
     throw new Error("站点地址必须使用 HTTP/HTTPS");
+  if (p.authMode === "cookie") return p;
   if (p.userId && !/^\d+$/.test(String(p.userId).trim()))
     throw new Error("请填写正确的 NewAPI 用户ID");
   if (!(p.accessToken || "").trim()) throw new Error("请填写访问令牌");
   return p;
+}
+
+function isAlreadyCheckinMessage(message) {
+  return /已签到|已经签到|签到过|重复签到|already\s+(?:checked\s+in|signed\s+in|today)|today\s+already/i.test(String(message || ""));
 }
 
 // ---------- 统计合并 ----------
@@ -171,9 +176,10 @@ async function checkin(id) {
   const r = await doCheckin(p);
   p.message = r.message;
   p.error = r.ok ? "" : r.message;
-  // 今日已签到判定：成功 或 站点提示已签到，都锚定今天，防止跨天误显
-  if (r.ok || /已签到|已经|already|今日|重复/i.test(r.message || "")) {
+  // 今日已签到判定：成功 或 站点明确提示重复签到，都锚定今天，防止跨天误显
+  if (r.ok || isAlreadyCheckinMessage(r.message)) {
     p.stats = p.stats || {};
+    if (r.data && r.data.stats) Object.assign(p.stats, r.data.stats);
     p.stats.checked_in_today = true;
     p.statsDate = todayStr();
   }

@@ -323,15 +323,25 @@ async function runCheckin(platform) {
       (/agentrouter\.org/i.test(platform.baseUrl || "") || !!platform.triggerSelf);
     const method = isSelfTrigger ? "GET" : "POST";
     const body = await callCheckin(platform, method);
-    const awarded = body.data && body.data.quota_awarded;
-    const uname = body.data && (body.data.username || body.data.display_name);
+    let data = body.data;
+    // 部分兼容站点的 POST 只返回奖励额度；追加一次只读 GET，补齐本月统计。
+    if (!isSelfTrigger && !(data && data.stats)) {
+      try {
+        const statsBody = await callCheckin(platform, "GET", currentMonth());
+        if (statsBody && statsBody.data) data = { ...(data || {}), ...statsBody.data };
+      } catch {
+        // 签到已经成功，统计接口不可用时保留签到结果，不将整体降级为失败。
+      }
+    }
+    const awarded = data && data.quota_awarded;
+    const uname = data && (data.username || data.display_name);
     let msg = body.message;
     if (!msg) {
       if (awarded != null) msg = "签到成功，获得额度 " + awarded;
       else if (isSelfTrigger) msg = (uname ? "用户「" + uname + "」" : "") + "信息请求成功，签到已自动完成";
       else msg = "签到请求成功";
     }
-    return { ok: true, message: msg, data: body.data };
+    return { ok: true, message: msg, data };
   } catch (e) {
     return { ok: false, message: e.message, error: e.message };
   }
@@ -446,10 +456,13 @@ function mergeStats(platform, data, message, ok) {
 // 分类签到结果：成功 / 今日已签到 / 失败
 function classify(result) {
   if (result.ok) return "ok";
-  const m = (result.message || "").toLowerCase();
-  if (m.includes("已签到") || m.includes("已经") || m.includes("already") || m.includes("今日"))
+  if (isAlreadyCheckinMessage(result.message))
     return "already";
   return "fail";
+}
+
+function isAlreadyCheckinMessage(message) {
+  return /已签到|已经签到|签到过|重复签到|already\s+(?:checked\s+in|signed\s+in|today)|today\s+already/i.test(String(message || ""));
 }
 
 // ---------- 批量/自动签到（Service Worker 内执行，可脱离弹窗） ----------
@@ -476,9 +489,10 @@ async function runAutoCheckin(triggeredByUser = false) {
       cur[idx].message = r.message;
       cur[idx].error = r.ok ? "" : r.message;
       cur[idx].lastCheckinAt = new Date().toISOString();
-      // 跨天"今日已签到"锚点：成功或提示已签到即标记今天
-      if (r.ok || /已签到|已经|already|今日|重复/i.test(r.message || "")) {
+      // 跨天"今日已签到"锚点：成功或站点明确提示重复签到即标记今天
+      if (r.ok || isAlreadyCheckinMessage(r.message)) {
         cur[idx].stats = cur[idx].stats || {};
+        if (r.data && r.data.stats) Object.assign(cur[idx].stats, r.data.stats);
         cur[idx].stats.checked_in_today = true;
         cur[idx].statsDate = todayStr();
       }
@@ -582,19 +596,30 @@ chrome.runtime.onInstalled.addListener(async () => {
   await syncAlarm();
   await savePlatforms(await getPlatforms()); // 初始化存储键
 });
-// ---------- 侧边栏（Edge sidePanel API） ----------
-// 点击工具栏图标打开侧边栏；setPanelBehavior 不可用时由 onClicked 兜底。
-function setupSidePanel() {
+// ---------- 侧边栏（Chrome / Edge sidePanel API） ----------
+// 优先让浏览器原生处理工具栏点击；API 不可用时退化为宽屏管理页。
+async function setupSidePanel() {
   if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
-    chrome.sidePanel
-      .setPanelBehavior({ openPanelOnActionClick: true })
-      .catch(() => {});
+    try {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+      return true;
+    } catch {}
   }
+  return false;
 }
-setupSidePanel();
-chrome.runtime.onInstalled.addListener(setupSidePanel);
-chrome.action.onClicked.addListener((tab) => {
-  if (chrome.sidePanel && chrome.sidePanel.open) {
-    chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
+let sidePanelReady = setupSidePanel();
+chrome.runtime.onInstalled.addListener(() => {
+  sidePanelReady = setupSidePanel();
+});
+chrome.action.onClicked.addListener(async (tab) => {
+  // setPanelBehavior 成功时，Chrome / Edge 会自行打开侧边栏。
+  if (await sidePanelReady) return;
+  if (chrome.sidePanel && chrome.sidePanel.open && tab && tab.windowId != null) {
+    try {
+      await chrome.sidePanel.open({ windowId: tab.windowId });
+      return;
+    } catch {}
   }
+  // 较旧的 Chrome 或其他 Chromium 浏览器没有 sidePanel 时仍可正常使用。
+  chrome.tabs.create({ url: chrome.runtime.getURL("popup.html") }).catch(() => {});
 });

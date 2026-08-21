@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "NewAPI 中转站一键签到",
-  "version": "1.1.0",
-  "description": "管理多个 NewAPI 中转站，一键或定时自动签到领取额度。点击工具栏图标在侧边栏打开，数据仅存本地，令牌不出浏览器。",
+  "version": "1.2.0",
+  "description": "适用于 Chrome 和 Edge 的 NewAPI 签到扩展，支持侧边栏管理、批量签到和定时自动签到，数据仅存本地。",
   "permissions": ["storage", "alarms", "notifications", "tabs", "sidePanel", "scripting"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
