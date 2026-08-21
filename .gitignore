@@ -1,0 +1,10 @@
+﻿# 构建产物 / 旧打包
+*.zip
+
+# 误留的无关文件
+ar.go
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+node_modules/

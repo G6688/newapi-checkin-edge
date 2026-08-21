@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NewAPI 一键签到管理</title>
+        <script src="theme.js"></script>
+  
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body class="tab-mode">
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <h1>NewAPI 一键签到管理</h1>
+        <p class="subtitle">仅支持已启用签到接口的 NewAPI 及兼容站点。数据仅存本地，令牌不出浏览器。</p>
+      </div>
+      <div class="hero-actions">
+        <button class="theme-toggle" id="themeToggle" type="button" title="切换深/浅色界面" aria-label="切换深/浅色界面">☾</button>
+        <button class="btn btn-light" id="openTabBtn" title="在新标签页打开">展开</button>
+        <button class="btn btn-light" id="importBtn">导入</button>
+        <button class="btn btn-light" id="exportBtn">导出</button>
+        <button class="btn btn-dark" id="batchBtn">一键批量签到</button>
+        <button class="btn btn-primary" id="addBtn">添加平台</button>
+        <input id="fileInput" type="file" accept="application/json" hidden />
+      </div>
+    </header>
+
+    <section class="overview">
+      <div class="stat"><span class="stat-label">已管理平台</span><strong class="stat-value" id="totalPlatforms">0</strong></div>
+      <div class="stat"><span class="stat-label">今日已签到</span><strong class="stat-value" id="checkedPlatforms">0</strong></div>
+      <div class="stat"><span class="stat-label">本月签到次数</span><strong class="stat-value" id="monthCheckins">0</strong></div>
+      <div class="stat"><span class="stat-label">累计获取额度</span><strong class="stat-value" id="totalQuota">0.0000 <small>额度</small></strong></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div><h2>平台列表</h2><span class="hint">数据保存在 Edge 本地</span></div>
+        <div class="toolbar">
+          <input id="monthInput" type="month" />
+          <button class="btn btn-light" id="refreshBtn">刷新统计</button>
+        </div>
+      </div>
+      <div id="platformGrid" class="platform-grid"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><div><h2>定时自动签到</h2><span class="hint">后台自动执行，浏览器关闭时无法运行</span></div></div>
+      <div class="settings-row">
+        <label class="switch"><input type="checkbox" id="autoEnabled" /><span class="track"></span>开启定时签到</label>
+        <label class="field">执行间隔
+          <select id="intervalHours">
+            <option value="1">每 1 小时</option>
+            <option value="3">每 3 小时</option>
+            <option value="6">每 6 小时（推荐）</option>
+            <option value="12">每 12 小时</option>
+            <option value="24">每天 1 次</option>
+          </select>
+        </label>
+        <label class="switch"><input type="checkbox" id="notifyEnabled" checked /><span class="track"></span>签到后通知</label>
+        <button class="btn btn-primary" id="runNowBtn">立即执行一次</button>
+      </div>
+      <div id="lastAutoMsg" class="last-auto"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><div><h2>配置说明</h2></div></div>
+      <details open class="tutorial">
+        <summary>📖 如何获取 NewAPI 站点信息</summary>
+        <div class="tutorial-body">
+          <p class="warn">⚠ 切勿向任何人泄露访问令牌。本扩展不会上传你的任何数据，配置仅存于本地；建议导出配置备份，更换浏览器或清理缓存后配置会消失。</p>
+          <p><strong>步骤 1 · 站点地址</strong>：NewAPI 首页 URL，如 <code>https://your-newapi-site.com</code>（结尾不要带 /）。</p>
+          <p><strong>步骤 2 · 访问令牌</strong>：登录站点 → 右上角头像 →「个人设置」→ 生成「系统访问令牌」（约32位）并复制。⚠ 注意：必须是「个人设置」里的<u>系统访问令牌</u>，<u>不是</u>「令牌管理」里的 API 令牌（sk-开头）；签到接口只认前者，填错会报令牌无效或权限不足。</p>
+          <p><strong>步骤 3 · 用户ID（可选）</strong>：部分兼容站点要求填写，可在个人中心查看（一串数字）；官方 NewAPI 用令牌即可识别用户，可留空。</p>
+          <p class="hint">💡 保存前可点「检测连接」验证；原理是直接调用目标站点 <code>/api/user/checkin</code> 接口（GET 取统计 / POST 签到），无需中转服务器。</p>
+        </div>
+      </details>
+    </section>
+
+    <footer class="site-footer">NewAPI 签到 · Edge 本地扩展 · 令牌不上传</footer>
+  </main>
+
+  <div class="modal" id="modal">
+    <div class="modal-box">
+      <div class="modal-head"><h2 id="modalTitle">添加平台</h2><button class="close" id="closeBtn" aria-label="关闭">×</button></div>
+      <form id="platformForm">
+        <div class="form-grid auth-top">
+          <label>鉴权方式
+            <select id="authMode">
+              <option value="token">访问令牌（默认）</option>
+              <option value="cookie">登录 Cookie（浏览器已登录该站点）</option>
+            </select>
+          </label>
+          <p id="authHint" class="auth-hint">令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。</p>
+        </div>
+        <div class="form-grid">
+          <label>站点名称<input id="name" required placeholder="例如：我的 NewAPI 站点" /></label>
+          <label>NewAPI 站点地址<input id="baseUrl" required type="url" placeholder="https://ai.example.com" /></label>
+          <label>NewAPI 用户ID<input id="userId" inputmode="numeric" placeholder="可选，部分站点必填" /></label>
+          <label>访问令牌<input id="accessToken" required type="password" placeholder="站点生成的系统访问令牌" /></label>
+          <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>
+        </div>
+        <div id="connectionStatus" class="connection-status" role="status"></div>
+        <div class="card-actions" style="justify-content:flex-end;margin-top:16px">
+          <button type="button" class="btn btn-light" id="cancelBtn">取消</button>
+          <button type="button" class="btn btn-dark" id="testBtn">检测连接</button>
+          <button type="submit" class="btn btn-primary">保存配置</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal" id="deleteModal">
+    <div class="modal-box small">
+      <div class="modal-head"><h2>删除平台</h2><button class="close" id="deleteCloseBtn">×</button></div>
+      <p id="deleteMessage" class="message"></p>
+      <div class="card-actions" style="justify-content:flex-end">
+        <button class="btn btn-light" id="deleteCancelBtn">取消</button>
+        <button class="btn btn-danger" id="deleteConfirmBtn">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

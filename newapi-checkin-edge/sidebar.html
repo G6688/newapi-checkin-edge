@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NewAPI 一键签到 · 侧边栏</title>
+        <script src="theme.js"></script>
+  
+  <link rel="stylesheet" href="sidebar.css" />
+</head>
+<body class="sidebar-mode">
+  <header class="appbar">
+    <div class="appbar-left">
+      <img src="icons/icon32.png" alt="" class="appbar-logo" />
+      <div>
+        <h1>NewAPI 一键签到</h1>
+        <p class="subtitle">令牌仅存本地，永不上传</p>
+      </div>
+    </div>
+    <div class="appbar-right">
+      <button class="iconbtn" id="importBtn" title="导入配置">导入</button>
+      <button class="iconbtn" id="exportBtn" title="导出配置">导出</button>
+      <button class="iconbtn" id="openTabBtn" title="在新标签页打开宽屏管理页">展开</button>
+      <button class="iconbtn theme-toggle" id="themeToggle" type="button" title="切换深/浅色界面" aria-label="切换深/浅色界面">☾</button>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="overview">
+      <div class="stat"><span class="stat-label">已管理</span><strong class="stat-value" id="totalPlatforms">0</strong></div>
+      <div class="stat"><span class="stat-label">今日已签</span><strong class="stat-value" id="checkedPlatforms">0</strong></div>
+      <div class="stat"><span class="stat-label">本月签到</span><strong class="stat-value" id="monthCheckins">0</strong></div>
+      <div class="stat"><span class="stat-label">累计额度</span><strong class="stat-value" id="totalQuota">0.0000</strong></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2><span class="dot"></span>平台列表</h2>
+        <div class="toolbar">
+          <input id="monthInput" type="month" aria-label="选择月份" />
+          <button class="btn btn-light btn-sm" id="refreshBtn" title="刷新统计">↻</button>
+        </div>
+      </div>
+      <div id="platformGrid" class="platform-grid"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2><span class="dot"></span>定时自动签到</h2></div>
+      <div class="settings">
+        <label class="switch-row">
+          <span class="switch-label">开启定时签到</span>
+          <span class="switch"><input type="checkbox" id="autoEnabled" /><span class="track"></span></span>
+        </label>
+        <label class="switch-row">
+          <span class="switch-label">签到后通知</span>
+          <span class="switch"><input type="checkbox" id="notifyEnabled" checked /><span class="track"></span></span>
+        </label>
+        <label class="field-row">
+          <span class="switch-label">执行间隔</span>
+          <select id="intervalHours">
+            <option value="1">每 1 小时</option>
+            <option value="3">每 3 小时</option>
+            <option value="6">每 6 小时（推荐）</option>
+            <option value="12">每 12 小时</option>
+            <option value="24">每天 1 次</option>
+          </select>
+        </label>
+        <button class="btn btn-dark btn-block" id="runNowBtn">立即执行一次</button>
+        <div id="lastAutoMsg" class="last-auto"></div>
+      </div>
+    </section>
+
+    <details class="tutorial">
+      <summary>📖 如何获取 NewAPI 站点信息</summary>
+      <div class="tutorial-body">
+        <p class="warn">⚠ 切勿向任何人泄露访问令牌。本扩展不上传任何数据，配置仅存本地；建议导出备份。</p>
+        <p><strong>1 · 站点地址</strong>：NewAPI 首页 URL，如 <code>https://your-newapi-site.com</code>（结尾不带 /）。</p>
+        <p><strong>2 · 访问令牌</strong>：站点 → 头像 →「个人设置」→ 生成「系统访问令牌」(约32位) 复制。⚠ 必须是「个人设置」的系统访问令牌，不是「令牌管理」的 API 令牌(sk-开头)，签到只认前者。</p>
+        <p><strong>3 · 用户ID</strong>：可选，部分兼容站点必填，在个人中心查看；官方 NewAPI 可留空。</p>
+      </div>
+    </details>
+
+    <footer class="site-footer">NewAPI 签到 · Edge 本地扩展</footer>
+  </main>
+
+  <footer class="actionbar">
+    <button class="btn btn-light btn-block" id="importBtn2" title="同上方导入">导入</button>
+    <button class="btn btn-dark btn-block" id="addBtn">添加平台</button>
+    <button class="btn btn-primary btn-block" id="batchBtn">一键签到</button>
+  </footer>
+
+  <!-- 导入文件选择（隐藏） -->
+  <input id="fileInput" type="file" accept="application/json" hidden />
+
+  <!-- 添加/编辑平台 -->
+  <div class="modal" id="modal">
+    <div class="modal-box">
+      <div class="modal-head"><h2 id="modalTitle">添加平台</h2><button class="close" id="closeBtn" aria-label="关闭">×</button></div>
+      <form id="platformForm">
+        <div class="form-grid auth-top">
+          <label>鉴权方式
+            <select id="authMode">
+              <option value="token">访问令牌（默认）</option>
+              <option value="cookie">登录 Cookie（浏览器已登录该站点）</option>
+            </select>
+          </label>
+          <p id="authHint" class="auth-hint">令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。</p>
+        </div>
+        <div class="form-grid">
+          <label>站点名称<input id="name" required placeholder="例如：我的 NewAPI 站点" /></label>
+          <label>NewAPI 站点地址<input id="baseUrl" required type="url" placeholder="https://ai.example.com" /></label>
+          <label>NewAPI 用户ID<input id="userId" inputmode="numeric" placeholder="可选，部分站点必填" /></label>
+          <label>访问令牌<input id="accessToken" required type="password" placeholder="站点系统访问令牌" /></label>
+          <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>
+        </div>
+        <div id="connectionStatus" class="connection-status" role="status"></div>
+        <div class="card-actions" style="justify-content:flex-end;margin-top:16px">
+          <button type="button" class="btn btn-light" id="cancelBtn">取消</button>
+          <button type="button" class="btn btn-dark" id="testBtn">检测连接</button>
+          <button type="submit" class="btn btn-primary">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 删除确认 -->
+  <div class="modal" id="deleteModal">
+    <div class="modal-box small">
+      <div class="modal-head"><h2>删除平台</h2><button class="close" id="deleteCloseBtn">×</button></div>
+      <p id="deleteMessage" class="message"></p>
+      <div class="card-actions" style="justify-content:flex-end">
+        <button class="btn btn-light" id="deleteCancelBtn">取消</button>
+        <button class="btn btn-danger" id="deleteConfirmBtn">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
