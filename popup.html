@@ -45,18 +45,13 @@
     </section>
 
     <section class="panel">
-      <div class="panel-head"><div><h2>定时自动签到</h2><span class="hint">后台自动执行，浏览器关闭时无法运行</span></div></div>
+      <div class="panel-head"><div><h2>定时自动签到</h2><span class="hint">每天到达指定时间后检查；浏览器关闭期间会在下次启动时补检</span></div></div>
       <div class="settings-row">
         <label class="switch"><input type="checkbox" id="autoEnabled" /><span class="track"></span>开启定时签到</label>
-        <label class="field">执行间隔
-          <select id="intervalHours">
-            <option value="1">每 1 小时</option>
-            <option value="3">每 3 小时</option>
-            <option value="6">每 6 小时（推荐）</option>
-            <option value="12">每 12 小时</option>
-            <option value="24">每天 1 次</option>
-          </select>
+        <label class="field">每日签到时间
+          <input id="autoTime" type="time" value="08:01" />
         </label>
+        <label class="switch"><input type="checkbox" id="autoApprove" /><span class="track"></span>自动允许一键签到</label>
         <label class="switch"><input type="checkbox" id="notifyEnabled" checked /><span class="track"></span>签到后通知</label>
         <button class="btn btn-primary" id="runNowBtn">立即执行一次</button>
       </div>

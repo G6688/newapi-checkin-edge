@@ -7,6 +7,7 @@
 const KEY_PLATFORMS = "nacheckin.platforms";
 const KEY_SETTINGS = "nacheckin.settings";
 const KEY_LASTAUTO = "nacheckin.lastAuto";
+const KEY_AUTOSTATE = "nacheckin.autoState";
 const ALARM_NAME = "nacheckin.auto";
 const BATCH_INTERVAL = 500; // 批量签到间隔(ms)，对齐原网站
 
@@ -35,7 +36,7 @@ function setStore(obj) {
 const getPlatforms = () => getStore(KEY_PLATFORMS, []);
 const savePlatforms = (list) => setStore({ [KEY_PLATFORMS]: list });
 const getSettings = () =>
-  getStore(KEY_SETTINGS, { autoEnabled: false, intervalHours: 6, notify: true });
+  getStore(KEY_SETTINGS, { autoEnabled: false, autoTime: "08:01", autoApprove: false, notify: true });
 const saveSettings = (s) => setStore({ [KEY_SETTINGS]: s });
 
 // ---------- 校验 ----------
@@ -164,6 +165,138 @@ function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query) {
     try { body = await res.json(); } catch {}
     return { ok: res.ok, status: res.status, body };
   })();
+}
+
+// 在目标站点页面内完成 Turnstile 验证，再用同一页面上下文提交签到。
+// Turnstile site key 受域名限制，不能在 Service Worker 或扩展页面中渲染。
+function tabFetchTurnstileCheckin(accessToken, userId) {
+  return new Promise((resolve) => {
+    const overlayId = "__nacheckin_turnstile_overlay";
+    const old = document.getElementById(overlayId);
+    if (old) old.remove();
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      const el = document.getElementById(overlayId);
+      if (el) el.remove();
+      resolve(value);
+    };
+    const fail = (message, verified = false) => finish({ ok: false, status: 0, body: { success: false, message }, verified });
+    const overlay = document.createElement("div");
+    overlay.id = overlayId;
+    overlay.style.cssText = "position:fixed;z-index:2147483647;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;font:14px system-ui,sans-serif;color:#1f2937";
+    const card = document.createElement("div");
+    card.style.cssText = "width:min(420px,calc(100vw - 32px));background:#fff;border-radius:12px;padding:24px;box-shadow:0 16px 48px rgba(0,0,0,.3);text-align:center";
+    const title = document.createElement("div");
+    title.textContent = "请完成安全验证后签到";
+    title.style.cssText = "font-size:18px;font-weight:600;margin-bottom:8px";
+    const hint = document.createElement("div");
+    hint.textContent = "验证通过后将自动提交签到，请不要关闭此页面。";
+    hint.style.cssText = "color:#6b7280;margin-bottom:16px";
+    const widget = document.createElement("div");
+    widget.style.cssText = "display:flex;justify-content:center;min-height:65px";
+    card.append(title, hint, widget);
+    overlay.appendChild(card);
+    (document.body || document.documentElement).appendChild(overlay);
+
+    const headers = { "Content-Type": "application/json", "Accept": "application/json, text/plain, */*" };
+    if (accessToken) headers.Authorization = "Bearer " + accessToken;
+    if (userId && /^\d+$/.test(String(userId))) headers["New-Api-User"] = String(userId);
+    let submitted = false;
+    const submit = async (token) => {
+      if (submitted) return;
+      submitted = true;
+      try {
+        const res = await fetch("/api/user/checkin?turnstile=" + encodeURIComponent(token), {
+          method: "POST", headers, credentials: "include",
+        });
+        let body = null;
+        try { body = await res.json(); } catch {}
+        finish({ ok: res.ok, status: res.status, body, verified: true });
+      } catch (e) {
+        fail("签到请求失败：" + (e && e.message ? e.message : "无法连接站点"), true);
+      }
+    };
+    const render = (siteKey) => {
+      if (!siteKey) return fail("站点未返回 Turnstile site key");
+      if (!window.turnstile || typeof window.turnstile.render !== "function") return fail("Turnstile 组件加载失败，请刷新页面重试");
+      try {
+        window.turnstile.render(widget, {
+          sitekey: siteKey,
+          callback: (token) => submit(token),
+          "error-callback": () => fail("Turnstile 验证失败，请刷新页面重试"),
+          "expired-callback": () => fail("Turnstile 验证已过期，请刷新页面重试"),
+        });
+      } catch (e) {
+        fail("Turnstile 初始化失败：" + (e && e.message ? e.message : "未知错误"));
+      }
+    };
+    const load = (siteKey) => {
+      if (window.turnstile) return render(siteKey);
+      let script = document.querySelector('script[src*="challenges.cloudflare.com/turnstile/v0/api.js"]');
+      if (!script) {
+        script = document.createElement("script");
+        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+        script.async = true;
+        script.defer = true;
+        document.head.appendChild(script);
+      }
+      const started = Date.now();
+      const poll = () => {
+        if (window.turnstile) return render(siteKey);
+        if (Date.now() - started > 15000) return fail("Turnstile 组件加载超时，请刷新页面重试");
+        setTimeout(poll, 200);
+      };
+      poll();
+    };
+    fetch("/api/status", { credentials: "include" })
+      .then((r) => r.json())
+      .then((body) => load(body && body.data && body.data.turnstile_site_key))
+      .catch(() => fail("无法读取站点 Turnstile 配置"));
+    setTimeout(() => fail("等待 Turnstile 验证超时"), 120000);
+  });
+}
+
+function isTurnstileMissingMessage(message) {
+  return /Turnstile\s*(?:token\s*)?(?:为空|empty|missing)|turnstile token is empty/i.test(String(message || ""));
+}
+
+async function runTurnstileCheckin(platform) {
+  validatePlatform(platform);
+  const base = (platform.baseUrl || "").trim().replace(/\/+$/, "");
+  const origin = new URL(base).origin;
+  let tab = null;
+  let createdTabId = null;
+  const tabs = await chrome.tabs.query({ url: origin + "/*" }).catch(() => []);
+  if (tabs && tabs.length) tab = tabs.find((t) => t.url && !/(login|signin|register)/i.test(t.url)) || tabs[0];
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: base, active: true });
+    createdTabId = tab.id;
+  }
+  if (tab && tab.id != null) {
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  }
+  if (tab && tab.id != null && ((createdTabId != null && tab.status !== "complete") || (createdTabId == null && tab.status && tab.status !== "complete"))) await waitTabComplete(tab.id);
+  let result;
+  try {
+    const out = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: tabFetchTurnstileCheckin,
+      args: [platform.authMode === "cookie" ? "" : String(platform.accessToken || "").trim(), String(platform.userId || "").trim()],
+    });
+    result = out && out[0] && out[0].result;
+  } catch (e) {
+    throw new Error("无法在站点页面启动 Turnstile 验证：" + (e && e.message ? e.message : "请先打开目标站点"));
+  }
+  const verified = !!(result && result.verified);
+  try {
+    return throwOnBadResult(result, "POST", { triggerSelf: false });
+  } finally {
+    if (verified && createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
+  }
 }
 
 // Cookie 模式：复用已打开的同源标签页，没有则临时开一个后台标签页完成后关闭
@@ -322,7 +455,13 @@ async function runCheckin(platform) {
     const isSelfTrigger = platform.authMode === "cookie" &&
       (/agentrouter\.org/i.test(platform.baseUrl || "") || !!platform.triggerSelf);
     const method = isSelfTrigger ? "GET" : "POST";
-    const body = await callCheckin(platform, method);
+    let body;
+    try {
+      body = await callCheckin(platform, method);
+    } catch (e) {
+      if (!isTurnstileMissingMessage(e && e.message)) throw e;
+      body = await runTurnstileCheckin(platform);
+    }
     let data = body.data;
     // 部分兼容站点的 POST 只返回奖励额度；追加一次只读 GET，补齐本月统计。
     if (!isSelfTrigger && !(data && data.stats)) {
@@ -466,10 +605,10 @@ function isAlreadyCheckinMessage(message) {
 }
 
 // ---------- 批量/自动签到（Service Worker 内执行，可脱离弹窗） ----------
-async function runAutoCheckin(triggeredByUser = false) {
+async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null) {
   const settings = await getSettings();
   if (!settings.autoEnabled && !triggeredByUser) return { skipped: true };
-  const platforms = await getPlatforms();
+  const platforms = selectedPlatforms || await getPlatforms();
   if (!platforms.length) return { skipped: true };
   // 并发签到：所有平台同时发起，互不等待（cookie 模式各站独立复用各自标签页，无冲突）
   const results = await Promise.all(platforms.map((p) => runCheckin(p)));
@@ -518,6 +657,72 @@ async function runAutoCheckin(triggeredByUser = false) {
   return summary;
 }
 
+function autoTimeReached(value) {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(value || ""));
+  if (!m) return false;
+  const now = new Date();
+  return now.getHours() * 60 + now.getMinutes() >= Number(m[1]) * 60 + Number(m[2]);
+}
+
+async function findUncheckedPlatforms(platforms) {
+  const results = await Promise.all(platforms.map(async (p) => {
+    if (p.stats && p.stats.checked_in_today && p.statsDate === todayStr()) return null;
+    try {
+      const body = await callCheckin(p, "GET", currentMonth());
+      if (body && body.data && body.data.stats && body.data.stats.checked_in_today) return null;
+    } catch {
+      // 只读状态不可用时仍尝试签到，由签到接口返回最终结果。
+    }
+    return p;
+  }));
+  return results.filter(Boolean);
+}
+
+async function saveAutoState(date, state) {
+  await setStore({ [KEY_AUTOSTATE]: { date, state } });
+}
+
+function autoConfirmNotificationId(date) {
+  return "nacheckin-confirm-" + date;
+}
+
+async function checkScheduledAuto() {
+  const settings = await getSettings();
+  if (!settings.autoEnabled || !autoTimeReached(settings.autoTime || "08:01")) return { skipped: true };
+  const date = todayStr();
+  const state = await getStore(KEY_AUTOSTATE, null);
+  if (state && state.date === date && state.state !== "pending") return { skipped: true };
+  if (state && state.date === date && state.state === "pending") return { pending: true };
+
+  const platforms = await getPlatforms();
+  if (!platforms.length) {
+    await saveAutoState(date, "done");
+    return { skipped: true };
+  }
+  const unchecked = await findUncheckedPlatforms(platforms);
+  if (!unchecked.length) {
+    await saveAutoState(date, "done");
+    return { skipped: true, already: true };
+  }
+  if (settings.autoApprove) {
+    await saveAutoState(date, "approved");
+    await runAutoCheckin(false, unchecked);
+    await saveAutoState(date, "done");
+    return { started: true, automatic: true };
+  }
+  await saveAutoState(date, "pending");
+  const id = autoConfirmNotificationId(date);
+  chrome.notifications.create(id, {
+    type: "basic",
+    iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+    title: "到达自动签到时间",
+    message: "今天还有站点未签到，是否立即执行一键签到？",
+    priority: 2,
+    buttons: [{ title: "允许签到" }, { title: "跳过今天" }],
+  }).catch(() => {});
+  return { pending: true };
+}
+
 function notify(title, message) {
   try {
     chrome.notifications.create("nacheckin-" + Date.now(), {
@@ -531,6 +736,22 @@ function notify(title, message) {
     /* 通知不可用时静默 */
   }
 }
+
+chrome.notifications.onButtonClicked.addListener(async (notificationId, buttonIndex) => {
+  if (!notificationId.startsWith("nacheckin-confirm-")) return;
+  const date = notificationId.slice("nacheckin-confirm-".length);
+  await chrome.notifications.clear(notificationId).catch(() => {});
+  if (buttonIndex !== 0) {
+    await saveAutoState(date, "declined");
+    return;
+  }
+  const settings = await getSettings();
+  if (!settings.autoEnabled || date !== todayStr()) return;
+  const unchecked = await findUncheckedPlatforms(await getPlatforms());
+  await saveAutoState(date, "approved");
+  if (unchecked.length) await runAutoCheckin(false, unchecked);
+  await saveAutoState(date, "done");
+});
 
 // ---------- 消息总线（popup <-> SW） ----------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -558,6 +779,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "saveSettings") {
         await saveSettings(msg.settings || {});
         await syncAlarm();
+        if (msg.settings && msg.settings.autoEnabled) checkScheduledAuto().catch(() => {});
         sendResponse({ ok: true, settings: msg.settings });
       } else if (msg.type === "getLastAuto") {
         const last = await getStore(KEY_LASTAUTO, null);
@@ -577,18 +799,17 @@ async function syncAlarm() {
   const s = await getSettings();
   await chrome.alarms.clear(ALARM_NAME);
   if (s.autoEnabled) {
-    const minutes = Math.max(1, Number(s.intervalHours) * 60 || 360);
-    chrome.alarms.create(ALARM_NAME, { periodInMinutes: minutes });
+    chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
   }
 }
 chrome.alarms.onAlarm.addListener((a) => {
-  if (a.name === ALARM_NAME) runAutoCheckin(false).catch(() => {});
+  if (a.name === ALARM_NAME) checkScheduledAuto().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  // 浏览器启动时若已开启自动签到，补执行一次
+  // 浏览器当天首次启动时，按用户设定时间补检一次。
   getSettings().then((s) => {
-    if (s.autoEnabled) runAutoCheckin(false).catch(() => {});
+    if (s.autoEnabled) checkScheduledAuto().catch(() => {});
   });
 });
 

@@ -334,15 +334,17 @@ function closeDelete() {
 
 // ---------- 设置 ----------
 async function applySettings(s) {
-  if (!s) s = { autoEnabled: false, intervalHours: 6, notify: true };
+  if (!s) s = { autoEnabled: false, autoTime: "08:01", autoApprove: false, notify: true };
   $("autoEnabled").checked = !!s.autoEnabled;
-  $("intervalHours").value = String(s.intervalHours || 6);
+  $("autoTime").value = /^([01]\d|2[0-3]):[0-5]\d$/.test(s.autoTime || "") ? s.autoTime : "08:01";
+  $("autoApprove").checked = !!s.autoApprove;
   $("notifyEnabled").checked = s.notify !== false;
 }
 async function saveSettings() {
   const settings = {
     autoEnabled: $("autoEnabled").checked,
-    intervalHours: Number($("intervalHours").value) || 6,
+    autoTime: $("autoTime").value || "08:01",
+    autoApprove: $("autoApprove").checked,
     notify: $("notifyEnabled").checked,
   };
   await send({ type: "saveSettings", settings });
@@ -399,7 +401,7 @@ function loadStorage() {
   return new Promise((resolve) => {
     chrome.storage.local.get([KEY_PLATFORMS, KEY_SETTINGS], (res) => {
       platforms = Array.isArray(res[KEY_PLATFORMS]) ? res[KEY_PLATFORMS] : [];
-      resolve(res[KEY_SETTINGS] || { autoEnabled: false, intervalHours: 6, notify: true });
+       resolve(res[KEY_SETTINGS] || { autoEnabled: false, autoTime: "08:01", autoApprove: false, notify: true });
     });
   });
 }
@@ -524,7 +526,8 @@ async function init() {
   if ($("themeToggle")) $("themeToggle").onclick = toggleTheme;
 
   $("autoEnabled").onchange = saveSettings;
-  $("intervalHours").onchange = saveSettings;
+  $("autoTime").onchange = saveSettings;
+  $("autoApprove").onchange = saveSettings;
   $("notifyEnabled").onchange = saveSettings;
   $("runNowBtn").onclick = async () => {
     $("runNowBtn").disabled = true;

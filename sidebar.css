@@ -148,6 +148,7 @@ button,select{font:inherit;color:inherit}
 .switch-row,.field-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .switch-label{font-size:13px;font-weight:600;color:var(--ink)}
 .field-row select{margin:0;padding:8px 11px;border:1px solid var(--field-border);border-radius:var(--radius-xs);outline:none;font:inherit;color:var(--ink);width:auto;background:var(--field-bg);appearance:none;-webkit-appearance:none;padding-right:30px;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a94a6' stroke-width='3'><path d='M6 9l6 6 6-6'/></svg>");background-repeat:no-repeat;background-position:right 9px center}
+.field-row input[type="time"]{margin:0;padding:8px 11px;width:auto}
 .field-row select:focus{border-color:var(--primary);box-shadow:var(--focus-ring)}
 .switch{position:relative;display:inline-block;flex-shrink:0}
 .switch input{display:none}

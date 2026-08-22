@@ -56,14 +56,12 @@
           <span class="switch"><input type="checkbox" id="notifyEnabled" checked /><span class="track"></span></span>
         </label>
         <label class="field-row">
-          <span class="switch-label">执行间隔</span>
-          <select id="intervalHours">
-            <option value="1">每 1 小时</option>
-            <option value="3">每 3 小时</option>
-            <option value="6">每 6 小时（推荐）</option>
-            <option value="12">每 12 小时</option>
-            <option value="24">每天 1 次</option>
-          </select>
+          <span class="switch-label">每日签到时间</span>
+          <input id="autoTime" type="time" value="08:01" />
+        </label>
+        <label class="switch-row">
+          <span class="switch-label">自动允许一键签到</span>
+          <span class="switch"><input type="checkbox" id="autoApprove" /><span class="track"></span></span>
         </label>
         <button class="btn btn-dark btn-block" id="runNowBtn">立即执行一次</button>
         <div id="lastAutoMsg" class="last-auto"></div>
