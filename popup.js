@@ -131,7 +131,7 @@ function render() {
   $("checkedPlatforms").textContent = platforms.filter((p) => p.stats && p.stats.checked_in_today && p.statsDate === today).length;
   $("monthCheckins").textContent = platforms.reduce((n, p) => n + ((p.stats && p.stats.checkin_count) || 0), 0);
   $("totalQuota").innerHTML =
-    formatQuota(platforms.reduce((n, p) => n + ((p.stats && p.stats.total_quota) || 0), 0)) + ' <small>$</small>';
+    formatQuota(platforms.reduce((n, p) => n + (Number(p.account && p.account.available) || 0), 0)) + ' <small>$</small>';
 
   if (!platforms.length) {
     grid.innerHTML = '<div class="empty">还没有平台配置，点击下方「添加平台」开始使用。</div>';
