@@ -67,6 +67,14 @@ Chrome 和 Edge 使用同一份扩展源码，无需下载不同版本。
 
 扩展不会读取、拼接或上传 Cookie 字符串。站点的登录状态仍由浏览器和站点自身管理。
 
+#### Agent Router 特殊处理
+
+`agentrouter.org` 使用登录 Cookie 请求 `GET /api/user/self` 触发签到，并要求退出后重新登录才能激活额度。每次签到（包括批量和定时签到）成功后，扩展会调用 `/api/user/logout`，然后打开该站点登录页；请在页面中完成重新登录。插件不会代填密码或验证码。
+
+当站点启用 GitHub 登录时，扩展会使用 Agent Router 自己的 `/api/oauth/state` 和 GitHub Client ID，在插件创建的临时标签页中自动发起 GitHub OAuth。OAuth 返回后，扩展会确认 `/api/user/self` 已恢复登录，短暂进入首页后关闭临时标签页。若 GitHub 要求输入账号、验证码或确认授权，页面会保留供你手动完成。
+
+如果站点返回登录页或安全验证页面而不是 JSON，扩展会将其识别为登录会话失效/安全校验，并保留登录页供你处理，不再显示笼统的“无法解析的数据”。
+
 ### Turnstile 验证签到
 
 部分 NewAPI 站点会在签到接口上启用 Cloudflare Turnstile。扩展检测到「Turnstile token 为空」后，会自动打开或复用目标站点标签页，并在站点页面内显示官方人机验证控件。

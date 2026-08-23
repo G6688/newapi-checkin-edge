@@ -8,6 +8,7 @@ const KEY_PLATFORMS = "nacheckin.platforms";
 const KEY_SETTINGS = "nacheckin.settings";
 const KEY_LASTAUTO = "nacheckin.lastAuto";
 const KEY_AUTOSTATE = "nacheckin.autoState";
+const KEY_AGENTROUTER_REAUTH = "nacheckin.agentRouterReauth";
 const ALARM_NAME = "nacheckin.auto";
 const BATCH_INTERVAL = 500; // 批量签到间隔(ms)，对齐原网站
 
@@ -65,10 +66,10 @@ const CODE_HINTS = {
   "AUTH_USER_INVALID": "用户信息无效。",
 };
 // ---------- 核心：直连 NewAPI 签到接口 ----------
-async function callCheckin(p, method = "GET", month) {
+async function callCheckin(p, method = "GET", month, opts) {
   validatePlatform(p);
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
-  if (p.authMode === "cookie") return await callViaTab(p, base, method, month);
+  if (p.authMode === "cookie") return await callViaTab(p, base, method, month, opts);
   const url = new URL(base + "/api/user/checkin");
   const headers = { "Content-Type": "application/json" };
   const token = (p.accessToken || "").trim();
@@ -137,6 +138,7 @@ function waitTabComplete(tabId) {
     const finish = () => { if (!done) { done = true; chrome.tabs.onUpdated.removeListener(listener); resolve(); } };
     const listener = (id, info) => { if (id === tabId && info.status === "complete") finish(); };
     chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => { if (tab && tab.status === "complete") finish(); }).catch(finish);
     setTimeout(finish, 12000);
   });
 }
@@ -151,9 +153,9 @@ function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query) {
     if (query) for (const k of Object.keys(query)) url.searchParams.set(k, String(query[k]));
     const headers = {
       "Accept": "application/json, text/plain, */*",
-      "Content-Type": "application/json",
-      "X-Requested-With": "XMLHttpRequest",
+      "Cache-Control": "no-store",
     };
+    if ((method || "GET").toUpperCase() !== "GET") headers["Content-Type"] = "application/json";
     if (userId) headers[(apiUserKey || "New-Api-User")] = String(userId);
     let res;
     try {
@@ -161,10 +163,191 @@ function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query) {
     } catch (e) {
       return { ok: false, status: 0, body: { success: false, message: "网络请求失败：" + (e && e.message ? e.message : "无法连接站点") } };
     }
+    const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+    const text = await res.text();
     let body = null;
-    try { body = await res.json(); } catch {}
-    return { ok: res.ok, status: res.status, body };
+    try { body = text ? JSON.parse(text) : null; } catch {}
+    const htmlResponse = contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text);
+    if (!body && htmlResponse) {
+      body = { success: false, message: "登录会话已失效或站点触发了安全验证，请打开目标站点重新登录或完成验证后重试" };
+    } else if (!body) {
+      body = { success: false, message: text ? "站点返回了非 JSON 数据，请稍后重试" : "站点返回了空响应，请稍后重试" };
+    }
+    return { ok: res.ok, status: res.status, body, htmlResponse };
   })();
+}
+
+// agentrouter.org 需要重新建立登录会话后才会激活签到额度。
+function tabLogout() {
+  return (async () => {
+    try {
+      let userId = "-1";
+      try {
+        const user = JSON.parse(localStorage.getItem("user") || "null");
+        if (user && user.id != null) userId = String(user.id);
+      } catch {}
+      const res = await fetch("/api/user/logout", {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          "Accept": "application/json, text/plain, */*",
+          "Cache-Control": "no-store",
+          "New-API-User": userId,
+        },
+      });
+      const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+      const text = await res.text();
+      let body = null;
+      try { body = text ? JSON.parse(text) : null; } catch {}
+      if (!body && (contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text))) {
+        body = { success: false, message: "登出请求被站点安全验证拦截" };
+      } else if (!body && text) {
+        body = { success: false, message: "登出接口返回了非 JSON 数据" };
+      }
+      if (res.ok && !(body && body.success === false)) {
+        try { localStorage.removeItem("user"); } catch {}
+      }
+      return { ok: res.ok && !(body && body.success === false), status: res.status, body };
+    } catch (e) {
+      return { ok: false, status: 0, body: { success: false, message: e && e.message ? e.message : "登出请求失败" } };
+    }
+  })();
+}
+
+function tabBuildGithubOauthUrl() {
+  return (async () => {
+    try {
+      let status = null;
+      try { status = JSON.parse(localStorage.getItem("status") || "null"); } catch {}
+      if (!status || !status.github_client_id) {
+        const statusRes = await fetch("/api/status", {
+          credentials: "include",
+          headers: { "Accept": "application/json, text/plain, */*", "Cache-Control": "no-store" },
+        });
+        const statusBody = await statusRes.json();
+        status = statusBody && statusBody.data;
+      }
+      const clientId = status && status.github_client_id;
+      if (!clientId) return { ok: false, message: "站点未提供 GitHub OAuth 配置" };
+      const params = new URLSearchParams();
+      const aff = localStorage.getItem("aff");
+      if (aff) params.set("aff", aff);
+      params.set("mode", "login");
+      const stateRes = await fetch("/api/oauth/state?" + params.toString(), {
+        credentials: "include",
+        headers: { "Accept": "application/json, text/plain, */*", "Cache-Control": "no-store" },
+      });
+      const stateBody = await stateRes.json();
+      if (!stateRes.ok || !stateBody || stateBody.success === false || !stateBody.data)
+        return { ok: false, message: stateBody && stateBody.message ? stateBody.message : "无法生成 GitHub 登录状态" };
+      localStorage.setItem("oauth_mode", "login");
+      return {
+        ok: true,
+        url: "https://github.com/login/oauth/authorize?client_id=" + encodeURIComponent(clientId) +
+          "&state=" + encodeURIComponent(stateBody.data) + "&scope=user%3Aemail",
+      };
+    } catch (e) {
+      return { ok: false, message: e && e.message ? e.message : "无法启动 GitHub 登录" };
+    }
+  })();
+}
+
+function tabCheckAgentRouterLogin(configuredUserId) {
+  return (async () => {
+    try {
+      let userId = String(configuredUserId || "-1");
+      try {
+        const user = JSON.parse(localStorage.getItem("user") || "null");
+        if (user && user.id != null) userId = String(user.id);
+      } catch {}
+      const res = await fetch("/api/user/self", {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          "Accept": "application/json, text/plain, */*",
+          "Cache-Control": "no-store",
+          "New-API-User": userId,
+        },
+      });
+      const text = await res.text();
+      let body = null;
+      try { body = text ? JSON.parse(text) : null; } catch {}
+      return { ok: res.ok && !!(body && body.success !== false && body.data), body };
+    } catch {
+      return { ok: false };
+    }
+  })();
+}
+
+async function startAgentRouterGithubReauth(base, userId) {
+  const old = await getStore(KEY_AGENTROUTER_REAUTH, null);
+  if (old && old.tabId != null) await chrome.tabs.remove(old.tabId).catch(() => {});
+  const tab = await chrome.tabs.create({ url: base + "/login", active: true });
+  await setStore({
+    [KEY_AGENTROUTER_REAUTH]: {
+      tabId: tab.id,
+      base,
+      origin: new URL(base).origin,
+      userId: String(userId || ""),
+      githubClicked: false,
+      createdAt: Date.now(),
+    },
+  });
+  await waitTabComplete(tab.id);
+  const current = await chrome.tabs.get(tab.id).catch(() => null);
+  handleAgentRouterReauthTab(tab.id, current && current.url).catch(() => {});
+  return tab;
+}
+
+const agentRouterReauthProcessing = new Set();
+async function handleAgentRouterReauthTab(tabId, tabUrl) {
+  const pending = await getStore(KEY_AGENTROUTER_REAUTH, null);
+  if (!pending || pending.tabId !== tabId || agentRouterReauthProcessing.has(tabId)) return;
+  // 六分钟仍未完成通常意味着 GitHub 要求用户输入凭据/验证码；保留页面，不再自动关闭。
+  if (Date.now() - Number(pending.createdAt || 0) > 6 * 60 * 1000) {
+    await setStore({ [KEY_AGENTROUTER_REAUTH]: null });
+    return;
+  }
+  agentRouterReauthProcessing.add(tabId);
+  try {
+    const url = String(tabUrl || "");
+    if (!url.startsWith(pending.origin + "/") && url !== pending.origin) return;
+    if (/\/login(?:[/?#]|$)/i.test(url)) {
+      if (pending.githubClicked) return;
+      let oauth = null;
+      try {
+        const out = await chrome.scripting.executeScript({ target: { tabId }, func: tabBuildGithubOauthUrl });
+        oauth = out && out[0] && out[0].result;
+      } catch {}
+      if (oauth && oauth.ok && oauth.url) {
+        const updated = await chrome.tabs.update(tabId, { url: oauth.url, active: true }).catch(() => null);
+        if (updated) {
+          pending.githubClicked = true;
+          await setStore({ [KEY_AGENTROUTER_REAUTH]: pending });
+        }
+      } else {
+        notify("Agent Router 自动登录未启动", (oauth && oauth.message) || "请在登录页手动点击「使用 GitHub 继续」");
+      }
+      return;
+    }
+    // OAuth 回到 Agent Router 后，给前端一点时间写入 localStorage 和登录 Cookie。
+    let loggedIn = false;
+    for (let i = 0; i < 8 && !loggedIn; i++) {
+      if (i) await wait(1200);
+      try {
+        const out = await chrome.scripting.executeScript({ target: { tabId }, func: tabCheckAgentRouterLogin, args: [pending.userId || ""] });
+        loggedIn = !!(out && out[0] && out[0].result && out[0].result.ok);
+      } catch {}
+    }
+    if (!loggedIn) return;
+    await chrome.tabs.update(tabId, { url: pending.base + "/", active: true }).catch(() => {});
+    await waitTabComplete(tabId);
+    await wait(1800);
+    await chrome.tabs.remove(tabId).catch(() => {});
+    await setStore({ [KEY_AGENTROUTER_REAUTH]: null });
+  } finally {
+    agentRouterReauthProcessing.delete(tabId);
+  }
 }
 
 // 在目标站点页面内完成 Turnstile 验证，再用同一页面上下文提交签到。
@@ -319,10 +502,11 @@ function cookieStrategy(p, base) {
   return { reqPath: "/api/user/checkin", reqMethod: "POST", apiUserKey: "New-Api-User", triggerSelf: false };
 }
 
-async function callViaTab(p, base, method, month) {
+async function callViaTab(p, base, method, month, opts) {
   const origin = new URL(base).origin;
   let tab = null;
   let createdTabId = null;
+  let keepCreatedTab = false;
   const tabs = await chrome.tabs.query({ url: origin + "/*" }).catch(() => []);
   if (tabs && tabs.length) {
     tab = tabs.find((t) => t.url && !/\/(login|signin|register)/i.test(t.url)) || tabs[0];
@@ -355,15 +539,49 @@ async function callViaTab(p, base, method, month) {
       const out = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: tabFetchCheckin,
-        args: [reqUrl, reqMethod, month || currentMonth() || null, String(p.userId || "").trim(), st.apiUserKey || null],
+        args: [reqUrl, reqMethod, st.triggerSelf ? null : (month || currentMonth() || null), String(p.userId || "").trim(), st.apiUserKey || null],
       });
       result = out && out[0] && out[0].result;
     } catch (e) {
       throw new Error("在站点标签页执行请求失败：" + (e && e.message ? e.message : "请先在浏览器登录该站点"));
     }
-    return throwOnBadResult(result, reqMethod, st);
+    if (result && result.htmlResponse && /agentrouter\.org/i.test(base)) {
+      // WAF 挑战只有在真实页面导航中才会执行；fetch 拿到挑战 HTML 时先打开接口页，完成挑战后重试一次。
+      try {
+        await chrome.tabs.update(tab.id, { url: new URL(reqUrl, base).toString(), active: true });
+        await wait(5000);
+        await chrome.tabs.update(tab.id, { url: base, active: true });
+        await waitTabComplete(tab.id);
+      } catch {}
+      try {
+        const retry = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: tabFetchCheckin,
+          args: [reqUrl, reqMethod, st.triggerSelf ? null : (month || currentMonth() || null), String(p.userId || "").trim(), st.apiUserKey || null],
+        });
+        result = retry && retry[0] && retry[0].result;
+      } catch {}
+    }
+    if (result && result.htmlResponse && /agentrouter\.org/i.test(base)) {
+      await chrome.tabs.update(tab.id, { url: base + "/login", active: true }).catch(() => {});
+      keepCreatedTab = true;
+    }
+    const body = throwOnBadResult(result, reqMethod, st);
+    if (opts && opts.reauth && st.triggerSelf && /agentrouter\.org/i.test(base)) {
+      let logoutResult = null;
+      try {
+        const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: tabLogout });
+        logoutResult = out && out[0] && out[0].result;
+      } catch {}
+      let reauthTab = null;
+      try { reauthTab = await startAgentRouterGithubReauth(base, p.userId); } catch {}
+      body._reauthRequired = true;
+      body._logoutOk = !!(logoutResult && logoutResult.ok);
+      body._githubLoginStarted = !!(reauthTab && reauthTab.id != null);
+    }
+    return body;
   } finally {
-    if (createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
+    if (createdTabId != null && !keepCreatedTab) await chrome.tabs.remove(createdTabId).catch(() => {});
   }
 }
 
@@ -449,7 +667,7 @@ async function callApi(p, reqPath, method, opts) {
 }
 
 // 签到
-async function runCheckin(platform) {
+async function runCheckin(platform, options) {
   try {
     // agentrouter 等无专用签到接口的站点：GET /api/user/self 触发签到
     const isSelfTrigger = platform.authMode === "cookie" &&
@@ -457,7 +675,9 @@ async function runCheckin(platform) {
     const method = isSelfTrigger ? "GET" : "POST";
     let body;
     try {
-      body = await callCheckin(platform, method);
+      body = await callCheckin(platform, method, null, {
+        reauth: !!(options && options.reauth),
+      });
     } catch (e) {
       if (!isTurnstileMissingMessage(e && e.message)) throw e;
       body = await runTurnstileCheckin(platform);
@@ -475,12 +695,29 @@ async function runCheckin(platform) {
     const awarded = data && data.quota_awarded;
     const uname = data && (data.username || data.display_name);
     let msg = body.message;
+    if (body._reauthRequired) {
+      if (body._githubLoginStarted) {
+        msg = "签到成功，正在通过 GitHub 自动重新登录；完成后临时页面会自动关闭";
+      } else {
+        msg = body._logoutOk
+          ? "签到成功，请在 Agent Router 登录页使用 GitHub 重新登录以激活额度"
+          : "签到已提交，请退出并重新登录 Agent Router 以激活额度";
+      }
+    } else if (isSelfTrigger && !(options && options.reauth)) {
+      msg = (msg || "签到成功") + "；请退出并重新登录 Agent Router 以激活额度";
+    }
     if (!msg) {
       if (awarded != null) msg = "签到成功，获得额度 " + awarded;
       else if (isSelfTrigger) msg = (uname ? "用户「" + uname + "」" : "") + "信息请求成功，签到已自动完成";
       else msg = "签到请求成功";
     }
-    return { ok: true, message: msg, data };
+    return {
+      ok: true,
+      message: msg,
+      data,
+      reauthRequired: !!body._reauthRequired,
+      githubLoginStarted: !!body._githubLoginStarted,
+    };
   } catch (e) {
     return { ok: false, message: e.message, error: e.message };
   }
@@ -611,7 +848,7 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
   const platforms = selectedPlatforms || await getPlatforms();
   if (!platforms.length) return { skipped: true };
   // 并发签到：所有平台同时发起，互不等待（cookie 模式各站独立复用各自标签页，无冲突）
-  const results = await Promise.all(platforms.map((p) => runCheckin(p)));
+  const results = await Promise.all(platforms.map((p) => runCheckin(p, { reauth: true })));
   let ok = 0, already = 0, fail = 0;
   const list = [];
   const cur = await getPlatforms();
@@ -753,6 +990,25 @@ chrome.notifications.onButtonClicked.addListener(async (notificationId, buttonIn
   await saveAutoState(date, "done");
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete" && !changeInfo.url) return;
+  handleAgentRouterReauthTab(tabId, changeInfo.url || (tab && tab.url) || "").catch(() => {});
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  getStore(KEY_AGENTROUTER_REAUTH, null).then((pending) => {
+    if (pending && pending.tabId === tabId) return setStore({ [KEY_AGENTROUTER_REAUTH]: null });
+  }).catch(() => {});
+});
+
+// Service Worker 休眠后恢复时，继续接管尚未完成的 OAuth 临时标签页。
+getStore(KEY_AGENTROUTER_REAUTH, null).then(async (pending) => {
+  if (!pending || pending.tabId == null) return;
+  const tab = await chrome.tabs.get(pending.tabId).catch(() => null);
+  if (!tab) return setStore({ [KEY_AGENTROUTER_REAUTH]: null });
+  handleAgentRouterReauthTab(tab.id, tab.url || "").catch(() => {});
+}).catch(() => {});
+
 // ---------- 消息总线（popup <-> SW） ----------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
@@ -769,7 +1025,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, message: e && e.message ? e.message : "无法获取账户额度" });
         }
       } else if (msg.type === "checkin") {
-        const r = await runCheckin(msg.platform);
+        const r = await runCheckin(msg.platform, { reauth: msg.reauth !== false });
         sendResponse(r);
       } else if (msg.type === "autoRun") {
         const summary = await runAutoCheckin(true);

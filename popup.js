@@ -71,7 +71,7 @@ function send(msg) {
 const slim = (p) => ({ baseUrl: p.baseUrl, userId: p.userId, accessToken: p.accessToken, authMode: p.authMode });
 const getStats = (p, month) =>
   send({ type: "stats", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
-const doCheckin = (p) => send({ type: "checkin", platform: slim(p) });
+const doCheckin = (p, reauth = true) => send({ type: "checkin", platform: slim(p), reauth });
 const getAccount = (p, month) =>
   send({ type: "account", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
 
@@ -167,13 +167,13 @@ function render() {
 }
 
 // ---------- 操作 ----------
-async function checkin(id) {
+async function checkin(id, options) {
   const p = platforms.find((x) => x.id === id);
   if (!p || p.loading) return;
   p.loading = true;
   p.error = "";
   render();
-  const r = await doCheckin(p);
+  const r = await doCheckin(p, !(options && options.reauth === false));
   p.message = r.message;
   p.error = r.ok ? "" : r.message;
   // 今日已签到判定：成功 或 站点明确提示重复签到，都锚定今天，防止跨天误显
@@ -187,7 +187,7 @@ async function checkin(id) {
   render();
   toast(p.name + "：" + r.message, !r.ok);
   await savePlatforms();
-  if (r.ok) await refreshStats(id, true);
+  if (r.ok && !r.reauthRequired) await refreshStats(id, true);
 }
 
 async function fetchStats(id, btnEl) {
@@ -274,7 +274,7 @@ function toggleAuthFields() {
   tokenInput.required = !isCookie;
   userIdInput.required = false;
   const hint = $("authHint");
-  if (hint) hint.textContent = isCookie ? "Cookie 模式：需已在浏览器登录该站点。agentrouter.org 等站点无签到接口——将带登录会话请求 /api/user/self 自动触发签到，请务必填写该站点用户ID（头条 new-api-user），否则会报无权操作。" : "令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。";
+  if (hint) hint.textContent = isCookie ? "Cookie 模式：需已在浏览器登录该站点。agentrouter.org 签到后会在临时标签页自动发起 GitHub 重新登录，成功进入首页后自动关闭；若 GitHub 要求验证码或授权，请手动完成。" : "令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。";
 }
 
 function editPlatform(id) {
