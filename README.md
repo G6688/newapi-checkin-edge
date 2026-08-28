@@ -9,7 +9,7 @@
 ## 功能
 
 - 在 Chrome / Edge 侧边栏或新标签页管理多个站点；
-- 支持「访问令牌」与「登录 Cookie」两种鉴权方式；
+- 支持「访问令牌」「Agent Router（GitHub 重登录签到）」与「登录 Cookie」鉴权方式；
 - 单个平台签到和一键批量签到；
 - 支持需要 Cloudflare Turnstile 人机验证的签到站点；
 - 支持自定义每日签到时间、浏览器启动补检和签到确认通知；
@@ -57,6 +57,12 @@ Chrome 和 Edge 使用同一份扩展源码，无需下载不同版本。
 
 令牌只在浏览器本地保存，用于直接请求你配置的站点。**请不要把包含令牌的导出文件提交到 GitHub 或发送给他人。**
 
+### Agent Router GitHub 重登录签到模式
+
+`agentrouter.org` 可选择专用的「Agent Router（GitHub 重登录签到）」模式。填写数字用户 ID，并确保浏览器已登录对应账号。扩展会先校验网站本地保存的当前用户 ID，再调用网站原生退出接口并启动 GitHub OAuth。
+
+Agent Router 当前版本在登录接口和 OAuth 回调响应的 `checked_in` 字段中返回签到结果，因此签到依赖浏览器 Cookie 会话，不需要系统访问令牌。若 GitHub 要求验证码、授权或输入凭据，请在临时页面中手动完成。
+
 ### 登录 Cookie 模式
 
 部分站点不允许使用系统访问令牌签到，只允许已登录浏览器会话调用接口：
@@ -69,9 +75,9 @@ Chrome 和 Edge 使用同一份扩展源码，无需下载不同版本。
 
 #### Agent Router 特殊处理
 
-`agentrouter.org` 使用登录 Cookie 请求 `GET /api/user/self` 触发签到，并要求退出后重新登录才能激活额度。每次签到（包括批量和定时签到）成功后，扩展会调用 `/api/user/logout`，然后打开该站点登录页；请在页面中完成重新登录。插件不会代填密码或验证码。
+`agentrouter.org` 在用户重新登录时完成签到。每次签到（包括批量和定时签到）会调用 `/api/user/logout`，然后打开该站点登录页并开始 GitHub OAuth；插件不会代填密码或验证码。
 
-当站点启用 GitHub 登录时，扩展会使用 Agent Router 自己的 `/api/oauth/state` 和 GitHub Client ID，在插件创建的临时标签页中自动发起 GitHub OAuth。OAuth 返回后，扩展会确认 `/api/user/self` 已恢复登录，短暂进入首页后关闭临时标签页。若 GitHub 要求输入账号、验证码或确认授权，页面会保留供你手动完成。
+扩展会使用 Agent Router 自己的 `/api/oauth/state` 和 GitHub Client ID，在临时标签页中发起 GitHub OAuth。OAuth 返回后，网站会调用 `/api/oauth/github`，把包含 `checked_in` 的登录结果写入本地用户状态；扩展确认该状态后关闭临时标签页。若 GitHub 要求输入账号、验证码或确认授权，页面会保留供你手动完成。
 
 如果站点返回登录页或安全验证页面而不是 JSON，扩展会将其识别为登录会话失效/安全校验，并保留登录页供你处理，不再显示笼统的“无法解析的数据”。
 

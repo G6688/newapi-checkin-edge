@@ -1,9 +1,6 @@
 // ===== NewAPI 一键签到 - 弹窗/侧边栏/宽屏页 共用逻辑 =====
 const KEY_PLATFORMS = "nacheckin.platforms";
 const KEY_SETTINGS = "nacheckin.settings";
-const BATCH_INTERVAL = 500;
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
 let platforms = [];
 let editingId = null;
 let connectionPromise = null;
@@ -88,6 +85,9 @@ function validatePlatform(p) {
   if (p.authMode === "cookie") return p;
   if (p.userId && !/^\d+$/.test(String(p.userId).trim()))
     throw new Error("请填写正确的 NewAPI 用户ID");
+  if (p.authMode === "agentrouter_token" && !/^\d+$/.test(String(p.userId || "").trim()))
+    throw new Error("Agent Router 签到模式必须填写数字用户ID");
+  if (p.authMode === "agentrouter_token") return p;
   if (!(p.accessToken || "").trim()) throw new Error("请填写访问令牌");
   return p;
 }
@@ -187,6 +187,7 @@ async function checkin(id, options) {
   render();
   toast(p.name + "：" + r.message, !r.ok);
   await savePlatforms();
+  // Agent Router 已退出且 GitHub OAuth 尚未完成时，账户接口可能返回登录页。
   if (r.ok && !r.reauthRequired) await refreshStats(id, true);
 }
 
@@ -215,10 +216,7 @@ async function refreshStats(id, silent) {
 }
 
 async function runBatch(action) {
-  for (let i = 0; i < platforms.length; i++) {
-    await action(platforms[i].id);
-    if (i < platforms.length - 1) await wait(BATCH_INTERVAL);
-  }
+  await Promise.all(platforms.map((p) => action(p.id)));
 }
 
 async function refreshAll() {
@@ -252,12 +250,12 @@ function openModal(p) {
   $("userId").value = p ? p.userId || "" : "";
   $("accessToken").value = p ? p.accessToken || "" : "";
   $("note").value = p ? p.note || "" : "";
-  // 鉴权方式：agentrouter.org 默认 Cookie（其签到接口拒绝访问令牌自动签到）
+  // Agent Router 使用网站原生退出与 GitHub OAuth 登录回调签到。
   if (p && p.authMode) {
-    $("authMode").value = p.authMode === "cookie" ? "cookie" : "token";
+    $("authMode").value = ["token", "cookie", "agentrouter_token"].includes(p.authMode) ? p.authMode : "token";
   } else {
     const u = $("baseUrl").value.trim();
-    $("authMode").value = /agentrouter\.org/i.test(u) ? "cookie" : "token";
+    $("authMode").value = /agentrouter\.org|ps\.air-outer\.com/i.test(u) ? "agentrouter_token" : "token";
   }
   toggleAuthFields();
   $("connectionStatus").className = "connection-status";
@@ -269,12 +267,21 @@ function openModal(p) {
 function toggleAuthFields() {
   const mode = $("authMode").value;
   const isCookie = mode === "cookie";
+  const isAgentRouterToken = mode === "agentrouter_token";
   const tokenInput = $("accessToken");
   const userIdInput = $("userId");
-  tokenInput.required = !isCookie;
-  userIdInput.required = false;
+  tokenInput.required = !isCookie && !isAgentRouterToken;
+  const tokenField = $("accessTokenField");
+  if (tokenField) tokenField.style.display = isCookie || isAgentRouterToken ? "none" : "";
+  userIdInput.required = isAgentRouterToken;
   const hint = $("authHint");
-  if (hint) hint.textContent = isCookie ? "Cookie 模式：需已在浏览器登录该站点。agentrouter.org 签到后会在临时标签页自动发起 GitHub 重新登录，成功进入首页后自动关闭；若 GitHub 要求验证码或授权，请手动完成。" : "令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。";
+  if (hint) {
+    hint.textContent = isCookie
+      ? "Cookie 模式：需已在浏览器登录该站点。agentrouter.org 签到后会在临时标签页自动发起 GitHub 重新登录，成功进入首页后自动关闭；若 GitHub 要求验证码或授权，请手动完成。"
+      : isAgentRouterToken
+        ? "Agent Router 模式：填写数字用户ID，并确保浏览器已登录对应账号；插件会退出当前会话并使用 GitHub 重新登录，签到结果由登录回调返回。"
+        : "令牌模式：填「个人设置」生成的系统访问令牌（约32位），非「令牌管理」的 API 令牌(sk-xxx)。";
+  }
 }
 
 function editPlatform(id) {
@@ -379,7 +386,7 @@ async function importConfig(file) {
     if (!Array.isArray(data)) throw new Error("配置格式必须是数组");
     platforms = data.map((p) => ({
       id: /^[A-Za-z0-9_-]{1,64}$/.test(p.id) ? p.id : Date.now().toString() + Math.random().toString(16).slice(2, 8),
-      authMode: p.authMode === "cookie" ? "cookie" : "token",
+      authMode: ["token", "cookie", "agentrouter_token"].includes(p.authMode) ? p.authMode : "token",
       name: p.name || "",
       baseUrl: p.baseUrl || "",
       userId: String(p.userId || ""),
@@ -446,7 +453,7 @@ async function init() {
   $("baseUrl").addEventListener("input", () => {
     if (!editingId && $("authMode")) {
       const u = $("baseUrl").value.trim();
-      const want = /agentrouter\.org/i.test(u) ? "cookie" : "token";
+      const want = /agentrouter\.org|ps\.air-outer\.com/i.test(u) ? "agentrouter_token" : "token";
       if ($("authMode").value !== want) { $("authMode").value = want; toggleAuthFields(); }
     }
   });
@@ -503,8 +510,8 @@ async function init() {
     if (!platforms.length) return toast("请先添加平台", true);
     $("batchBtn").disabled = true;
     try {
-      // 并发签到：所有平台立即同时发起，互不等待
-      await Promise.all(platforms.map((p) => checkin(p.id)));
+      // 各平台请求相互独立，同时发起以缩短批量签到耗时。
+      await runBatch((id) => checkin(id));
       toast("批量签到完成");
     } finally {
       $("batchBtn").disabled = false;

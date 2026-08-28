@@ -99,6 +99,7 @@
           <label>鉴权方式
             <select id="authMode">
               <option value="token">访问令牌（默认）</option>
+              <option value="agentrouter_token">Agent Router（GitHub 重登录签到）</option>
               <option value="cookie">登录 Cookie（浏览器已登录该站点）</option>
             </select>
           </label>
@@ -108,7 +109,7 @@
           <label>站点名称<input id="name" required placeholder="例如：我的 NewAPI 站点" /></label>
           <label>NewAPI 站点地址<input id="baseUrl" required type="url" placeholder="https://ai.example.com" /></label>
           <label>NewAPI 用户ID<input id="userId" inputmode="numeric" placeholder="可选，部分站点必填" /></label>
-          <label>访问令牌<input id="accessToken" required type="password" placeholder="站点系统访问令牌" /></label>
+          <label id="accessTokenField">访问令牌<input id="accessToken" required type="password" placeholder="站点系统访问令牌" /></label>
           <label class="full">备注<input id="note" placeholder="可选，例如主账号" /></label>
         </div>
         <div id="connectionStatus" class="connection-status" role="status"></div>

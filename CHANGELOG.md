@@ -55,3 +55,16 @@
 
 - 建议使用 Chrome 116+ 或 Edge 116+。
 - 配置数据继续保存在浏览器本地，升级到本版本不需要迁移原有平台配置。
+## 1.5.0
+
+- 新增 Agent Router GitHub 重登录签到模式。
+- 按网站当前实现调用退出、OAuth state 和 GitHub 登录回调，由登录响应的 `checked_in` 判断签到结果。
+- 改进非 JSON、登录跳转和安全验证响应的错误提示。
+- 批量签到改为并行执行，移除按站点串行等待逻辑。
+- Agent Router 退出并启动 GitHub 重登录后不再立即刷新额度，避免登录切换期间误报安全验证页面。
+- Agent Router 同源请求会等待页面加载完成，并在收到 HTML 登录页或安全验证页时稳定页面上下文后重试一次。
+- 删除 Agent Router 签到前错误的令牌 `/api/user/self` 请求，避免被重定向到首页后中断流程。
+- Agent Router 额度刷新改为在页面主环境中使用与网站 Axios 一致的 XHR 请求；接口异常时使用最近一次 OAuth 登录数据降级显示。
+- 兼容账户接口的 `quota`、`available_quota`、`remaining_quota` 等额度字段。
+- 修复 Agent Router 令牌模式额度刷新仍走 Service Worker 直连的问题，账户与日志接口统一改为站点页面同源请求。
+- 账户接口失败时不再仅因日志统计成功而静默显示空额度。

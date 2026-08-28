@@ -10,8 +10,6 @@ const KEY_LASTAUTO = "nacheckin.lastAuto";
 const KEY_AUTOSTATE = "nacheckin.autoState";
 const KEY_AGENTROUTER_REAUTH = "nacheckin.agentRouterReauth";
 const ALARM_NAME = "nacheckin.auto";
-const BATCH_INTERVAL = 500; // 批量签到间隔(ms)，对齐原网站
-
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function todayStr() {
@@ -53,7 +51,42 @@ function validatePlatform(p) {
   if (p.authMode === "cookie") return; // Cookie 模式：仅需站点地址 + 浏览器已登录该站点
   if (p.userId && !/^\d+$/.test(String(p.userId).trim()))
     throw new Error("请填写正确的 NewAPI 用户ID");
+  if (p.authMode === "agentrouter_token" && !/^\d+$/.test(String(p.userId || "").trim()))
+    throw new Error("Agent Router 签到模式必须填写数字用户ID");
+  if (p.authMode === "agentrouter_token") return;
   if (!(p.accessToken || "").trim()) throw new Error("请填写访问令牌");
+}
+
+function isAgentRouterTokenMode(p) {
+  return !!p && p.authMode === "agentrouter_token";
+}
+
+function isAgentRouterGithubMode(p) {
+  return isAgentRouterTokenMode(p) ||
+    (!!p && p.authMode === "cookie" && /agentrouter\.org/i.test(String(p.baseUrl || "")));
+}
+
+function isSelfTriggerMode(p) {
+  const base = String((p && p.baseUrl) || "");
+  return isAgentRouterTokenMode(p) ||
+    (!!p && p.authMode === "cookie" && (/agentrouter\.org|ps\.air-outer\.com/i.test(base) || !!p.triggerSelf));
+}
+
+function verifyConfiguredUser(p, body) {
+  const configured = String((p && p.userId) || "").trim();
+  const actual = body && body.data && body.data.id != null ? String(body.data.id) : "";
+  if (configured && actual && configured !== actual) {
+    throw new Error("当前 Agent Router 用户ID为 " + actual + "，与配置的 " + configured + " 不一致");
+  }
+  return body;
+}
+
+async function isAgentRouterReauthPending(p) {
+  if (!isAgentRouterGithubMode(p)) return false;
+  const pending = await getStore(KEY_AGENTROUTER_REAUTH, null);
+  if (!pending || !pending.origin || Date.now() - Number(pending.createdAt || 0) > 6 * 60 * 1000) return false;
+  try { return pending.origin === new URL(p.baseUrl).origin; }
+  catch { return false; }
 }
 
 // 上游 NewAPI 鉴权错误码 → 友好中文提示（来源：QuantumNous/new-api middleware/auth.go）
@@ -69,6 +102,12 @@ const CODE_HINTS = {
 async function callCheckin(p, method = "GET", month, opts) {
   validatePlatform(p);
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
+  if (isAgentRouterGithubMode(p)) {
+    if (opts && opts.reauth) return await runAgentRouterGithubCheckin(p, base);
+    const account = await callAgentRouterAccountViaTab(p, base);
+    if (account.warning) account.body._accountWarn = account.warning;
+    return account.body;
+  }
   if (p.authMode === "cookie") return await callViaTab(p, base, method, month, opts);
   const url = new URL(base + "/api/user/checkin");
   const headers = { "Content-Type": "application/json" };
@@ -102,6 +141,104 @@ async function callCheckin(p, method = "GET", month, opts) {
   if (!body.data || (method === "GET" && !body.data.stats))
     throw new Error("该站点不是兼容的 NewAPI 签到站点");
   return body;
+}
+
+async function getAgentRouterPage(base) {
+  const origin = new URL(base).origin;
+  const tabs = await chrome.tabs.query({ url: origin + "/*" }).catch(() => []);
+  let tab = tabs && tabs.find((t) => t.url && !/\/(login|signin|register)/i.test(t.url));
+  let createdTabId = null;
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: base, active: false }).catch(() => null);
+    if (!tab) throw new Error("无法打开 Agent Router 标签页");
+    createdTabId = tab.id;
+    await waitTabComplete(tab.id);
+  } else if (tab.status && tab.status !== "complete") {
+    await waitTabComplete(tab.id);
+  }
+  return { tab, createdTabId };
+}
+
+async function callAgentRouterAccountViaTab(p, base) {
+  const { tab, createdTabId } = await getAgentRouterPage(base);
+  let result = null;
+  try {
+    const out = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: tabFetchAgentRouterAccount,
+      args: [String(p.userId || "").trim()],
+    });
+    result = out && out[0] && out[0].result;
+  } catch (e) {
+    throw new Error("无法在 Agent Router 页面读取账户额度：" + (e && e.message ? e.message : "页面脚本执行失败"));
+  } finally {
+    if (createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
+  }
+
+  if (result && result.userMismatch) {
+    throw new Error("当前浏览器登录的 Agent Router 用户ID为 " + result.actualUserId + "，与配置的 " + result.configuredUserId + " 不一致");
+  }
+  if (result && result.ok && result.body && result.body.data) {
+    verifyConfiguredUser(p, result.body);
+    return {
+      body: result.body,
+      warning: result.usedCachedAccount
+        ? "用户接口连续返回异常零值，当前额度来自最近一次登录数据"
+        : "",
+    };
+  }
+  if (result && result.cachedUser) {
+    const body = { success: true, data: result.cachedUser };
+    verifyConfiguredUser(p, body);
+    return { body, warning: "用户接口返回异常，当前额度来自最近一次登录数据" };
+  }
+
+  const detail = result && result.message ? result.message : "网站未返回账户数据";
+  throw new Error("获取账户额度失败：" + detail);
+}
+
+// Agent Router 的当前前端在 OAuth/密码登录响应中通过 data.checked_in 返回签到结果。
+// 正确流程是退出当前 Cookie 会话后重新登录，不需要预先用访问令牌请求 /api/user/self。
+async function runAgentRouterGithubCheckin(p, base) {
+  const { tab, createdTabId } = await getAgentRouterPage(base);
+  let storedUser = null;
+  try {
+    const out = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: tabReadAgentRouterStoredUser,
+    });
+    storedUser = out && out[0] && out[0].result;
+  } catch {}
+  const configured = String(p.userId || "").trim();
+  const actual = storedUser && storedUser.id != null ? String(storedUser.id) : "";
+  if (configured && actual && configured !== actual) {
+    if (createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
+    throw new Error("当前浏览器登录的 Agent Router 用户ID为 " + actual + "，与配置的 " + configured + " 不一致");
+  }
+
+  let logoutResult = null;
+  try {
+    const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: tabLogout });
+    logoutResult = out && out[0] && out[0].result;
+  } catch {}
+  if (createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
+  if (storedUser && !logoutResult?.ok) {
+    throw new Error((logoutResult && logoutResult.body && logoutResult.body.message) || "Agent Router 退出失败，无法开始重新登录签到");
+  }
+
+  let reauthTab = null;
+  try { reauthTab = await startAgentRouterGithubReauth(base, p.userId); } catch {}
+  if (!reauthTab) throw new Error("Agent Router GitHub 登录页启动失败");
+  return {
+    success: true,
+    message: "已退出 Agent Router，正在通过 GitHub 重新登录并签到",
+    data: storedUser || { id: configured || null },
+    _reauthRequired: true,
+    _logoutOk: !storedUser || !!(logoutResult && logoutResult.ok),
+    _githubLoginStarted: true,
+  };
 }
 
 // 上游返回校验（cookie/token 共用）
@@ -174,6 +311,146 @@ function tabFetchCheckin(reqPath, method, month, userId, apiUserKey, query) {
       body = { success: false, message: text ? "站点返回了非 JSON 数据，请稍后重试" : "站点返回了空响应，请稍后重试" };
     }
     return { ok: res.ok, status: res.status, body, htmlResponse };
+  })();
+}
+
+function tabReadAgentRouterStoredUser() {
+  try {
+    const user = JSON.parse(localStorage.getItem("user") || "null");
+    if (!user || user.id == null) return null;
+    return {
+      id: user.id,
+      username: user.username || "",
+      display_name: user.display_name || "",
+      checked_in: !!user.checked_in,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// 与 Agent Router 当前前端的 Axios 请求保持一致：页面主世界、Cookie、New-API-User 和 XHR。
+function tabFetchAgentRouterAccount(configuredUserId) {
+  const readStoredUser = () => {
+    try {
+      const user = JSON.parse(localStorage.getItem("user") || "null");
+      if (!user || user.id == null) return null;
+      return {
+        id: user.id,
+        username: user.username || "",
+        display_name: user.display_name || "",
+        quota: user.quota ?? null,
+        available: user.available ?? null,
+        available_quota: user.available_quota ?? null,
+        remaining_quota: user.remaining_quota ?? null,
+        used_quota: user.used_quota ?? null,
+        usedQuota: user.usedQuota ?? null,
+        used: user.used ?? null,
+        request_count: user.request_count ?? null,
+        requestCount: user.requestCount ?? null,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  return (async () => {
+    const cachedUser = readStoredUser();
+    const configured = String(configuredUserId || "").trim();
+    const actual = cachedUser && cachedUser.id != null ? String(cachedUser.id) : "";
+    if (configured && actual && configured !== actual) {
+      return { userMismatch: true, configuredUserId: configured, actualUserId: actual };
+    }
+
+    const userId = actual || configured || "-1";
+    const valueOf = (data, names) => {
+      if (!data) return null;
+      for (const name of names) {
+        if (data[name] != null && data[name] !== "") return data[name];
+      }
+      return null;
+    };
+    const accountValues = (data) => ({
+      quota: valueOf(data, ["quota", "available", "available_quota", "remaining_quota"]),
+      used: valueOf(data, ["used_quota", "usedQuota", "used"]),
+    });
+    const isZero = (value) => value != null && value !== "" && Number(value) === 0;
+    const looksLikeEmptyAccount = (data) => {
+      const values = accountValues(data);
+      return isZero(values.quota) && isZero(values.used);
+    };
+    const cachedValues = accountValues(cachedUser);
+    const cachedHasBalance = [cachedValues.quota, cachedValues.used]
+      .some((value) => value != null && value !== "" && Number(value) !== 0);
+
+    const requestUser = (cacheBust) => new Promise((resolveRequest) => {
+      let xhr;
+      try {
+        xhr = new XMLHttpRequest();
+        const path = "/api/user/self" + (cacheBust ? "?_nacheckin=" + Date.now() : "");
+        xhr.open("GET", path, true);
+        xhr.withCredentials = true;
+        xhr.timeout = 15000;
+        xhr.setRequestHeader("Accept", "application/json, text/plain, */*");
+        xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+        xhr.setRequestHeader("New-API-User", userId);
+        xhr.setRequestHeader("Cache-Control", "no-cache, no-store, max-age=0");
+        xhr.setRequestHeader("Pragma", "no-cache");
+      } catch (e) {
+        resolveRequest({ ok: false, message: e && e.message ? e.message : "无法创建账户请求" });
+        return;
+      }
+
+      xhr.onload = () => {
+        const text = String(xhr.responseText || "");
+        const contentType = String(xhr.getResponseHeader("content-type") || "").toLowerCase();
+        let body = null;
+        try { body = text ? JSON.parse(text) : null; } catch {}
+        if (xhr.status >= 200 && xhr.status < 300 && body && body.success !== false && body.data) {
+          resolveRequest({ ok: true, status: xhr.status, responseUrl: xhr.responseURL, contentType, body });
+          return;
+        }
+        const htmlResponse = contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text);
+        const message = body && body.message
+          ? body.message
+          : htmlResponse
+            ? "用户接口被重定向到网页（HTTP " + xhr.status + "，" + (xhr.responseURL || "/api/user/self") + "）"
+            : "用户接口返回无效数据（HTTP " + xhr.status + "）";
+        resolveRequest({ ok: false, status: xhr.status, responseUrl: xhr.responseURL, contentType, htmlResponse, message });
+      };
+      xhr.onerror = () => resolveRequest({ ok: false, status: xhr.status || 0, message: "用户接口网络请求失败" });
+      xhr.ontimeout = () => resolveRequest({ ok: false, status: 0, message: "用户接口请求超时" });
+      try { xhr.send(); }
+      catch (e) { resolveRequest({ ok: false, status: 0, message: e && e.message ? e.message : "用户接口请求失败" }); }
+    });
+
+    let result = await requestUser(false);
+    if (!result.ok || (cachedHasBalance && looksLikeEmptyAccount(result.body && result.body.data))) {
+      const retry = await requestUser(true);
+      if (retry.ok || !result.ok) result = retry;
+    }
+
+    if (result.ok && cachedHasBalance && looksLikeEmptyAccount(result.body.data)) {
+      const liveUser = result.body.data;
+      result.body = {
+        ...result.body,
+        data: {
+          ...liveUser,
+          quota: cachedValues.quota,
+          used_quota: cachedValues.used,
+          request_count: valueOf(cachedUser, ["request_count", "requestCount"])
+            ?? valueOf(liveUser, ["request_count", "requestCount"]),
+        },
+      };
+      result.usedCachedAccount = true;
+    } else if (result.ok) {
+      try {
+        const stored = JSON.parse(localStorage.getItem("user") || "null") || {};
+        localStorage.setItem("user", JSON.stringify({ ...stored, ...result.body.data }));
+      } catch {}
+    }
+
+    return { ...result, cachedUser };
   })();
 }
 
@@ -253,30 +530,19 @@ function tabBuildGithubOauthUrl() {
 }
 
 function tabCheckAgentRouterLogin(configuredUserId) {
-  return (async () => {
-    try {
-      let userId = String(configuredUserId || "-1");
-      try {
-        const user = JSON.parse(localStorage.getItem("user") || "null");
-        if (user && user.id != null) userId = String(user.id);
-      } catch {}
-      const res = await fetch("/api/user/self", {
-        method: "GET",
-        credentials: "include",
-        headers: {
-          "Accept": "application/json, text/plain, */*",
-          "Cache-Control": "no-store",
-          "New-API-User": userId,
-        },
-      });
-      const text = await res.text();
-      let body = null;
-      try { body = text ? JSON.parse(text) : null; } catch {}
-      return { ok: res.ok && !!(body && body.success !== false && body.data), body };
-    } catch {
-      return { ok: false };
-    }
-  })();
+  try {
+    const user = JSON.parse(localStorage.getItem("user") || "null");
+    if (!user || user.id == null) return { ok: false };
+    const configured = String(configuredUserId || "").trim();
+    const actual = String(user.id);
+    return {
+      ok: !configured || configured === actual,
+      userId: actual,
+      checkedIn: !!user.checked_in,
+    };
+  } catch {
+    return { ok: false };
+  }
 }
 
 async function startAgentRouterGithubReauth(base, userId) {
@@ -330,13 +596,14 @@ async function handleAgentRouterReauthTab(tabId, tabUrl) {
       }
       return;
     }
-    // OAuth 回到 Agent Router 后，给前端一点时间写入 localStorage 和登录 Cookie。
+    // OAuth 回到 Agent Router 后，等待网站回调把登录响应（含 checked_in）写入 localStorage。
     let loggedIn = false;
     for (let i = 0; i < 8 && !loggedIn; i++) {
       if (i) await wait(1200);
       try {
         const out = await chrome.scripting.executeScript({ target: { tabId }, func: tabCheckAgentRouterLogin, args: [pending.userId || ""] });
-        loggedIn = !!(out && out[0] && out[0].result && out[0].result.ok);
+        const loginState = out && out[0] && out[0].result;
+        loggedIn = !!(loginState && loginState.ok);
       } catch {}
     }
     if (!loggedIn) return;
@@ -484,7 +751,7 @@ async function runTurnstileCheckin(platform) {
 
 // Cookie 模式：复用已打开的同源标签页，没有则临时开一个后台标签页完成后关闭
 // 平台签到策略：决定 Cookie 模式下用哪个路径/方法
-// agentrouter.org 等站点无签到接口，GET /api/user/self 即触发签到（参考 millylee/anyrouter-check-in）
+// Cookie 模式下的只读账户请求策略；Agent Router 的实际签到由 GitHub 重登录完成。
 function cookieStrategy(p, base) {
   const h = (p && p.checkinPath || "").trim();
   if (h) {
@@ -645,8 +912,17 @@ async function callApiPath(p, reqPath, method, opts) {
   } catch (e) {
     throw new Error("网络请求失败：" + (e && e.message ? e.message : "无法连接站点"));
   }
-  let body;
-  try { body = await res.json(); } catch { throw new Error("站点返回了无法解析的数据"); }
+  const contentType = String(res.headers && res.headers.get ? (res.headers.get("content-type") || "") : "").toLowerCase();
+  let text = "";
+  try { text = await res.text(); } catch { text = ""; }
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch {}
+  if (!body) {
+    if (contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text)) {
+      throw new Error("Agent Router 用户接口返回了网页页面，可能是登录跳转或安全验证（HTTP " + res.status + "）");
+    }
+    throw new Error("Agent Router 用户接口返回了无法解析的数据（HTTP " + res.status + "）");
+  }
   if (!res.ok || body.success === false) {
     const code = (body && body.code) || "";
     const hint = CODE_HINTS[code] || "";
@@ -655,10 +931,10 @@ async function callApiPath(p, reqPath, method, opts) {
   return body;
 }
 
-// 按 authMode 分发：cookie 走 callViaTabRaw（自动用站点 apiUserKey），token 走 callApiPath
+// 按 authMode 分发：Cookie/Agent Router 复用网站原生会话，普通 token 由 Service Worker 直连。
 async function callApi(p, reqPath, method, opts) {
   const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
-  if (p.authMode === "cookie") {
+  if (p.authMode === "cookie" || isAgentRouterTokenMode(p)) {
     const st = cookieStrategy(p, base);
     const merged = Object.assign({ apiUserKey: st.apiUserKey }, opts || {});
     return await callViaTabRaw(p, base, reqPath, method, merged);
@@ -669,9 +945,8 @@ async function callApi(p, reqPath, method, opts) {
 // 签到
 async function runCheckin(platform, options) {
   try {
-    // agentrouter 等无专用签到接口的站点：GET /api/user/self 触发签到
-    const isSelfTrigger = platform.authMode === "cookie" &&
-      (/agentrouter\.org/i.test(platform.baseUrl || "") || !!platform.triggerSelf);
+    // Agent Router 通过退出并重新登录签到；其他自触发兼容站点仍使用 GET 请求。
+    const isSelfTrigger = isSelfTriggerMode(platform);
     const method = isSelfTrigger ? "GET" : "POST";
     let body;
     try {
@@ -703,6 +978,8 @@ async function runCheckin(platform, options) {
           ? "签到成功，请在 Agent Router 登录页使用 GitHub 重新登录以激活额度"
           : "签到已提交，请退出并重新登录 Agent Router 以激活额度";
       }
+    } else if (isAgentRouterTokenMode(platform)) {
+      msg = (msg || "Agent Router 签到已触发") + "；如额度未到账，请在网页退出并重新登录";
     } else if (isSelfTrigger && !(options && options.reauth)) {
       msg = (msg || "签到成功") + "；请退出并重新登录 Agent Router 以激活额度";
     }
@@ -768,11 +1045,26 @@ async function fetchMonthlyTokens(platform, month) {
 }
 
 async function fetchAccount(platform, month, reuseSelfData) {
+  if (await isAgentRouterReauthPending(platform)) {
+    throw new Error("Agent Router 正在通过 GitHub 重新登录，请在登录完成后刷新额度");
+  }
   let selfData = reuseSelfData || null;
   let selfErr = "";
+  let accountWarn = "";
   if (!selfData) {
     try {
-      const selfBody = await callApi(platform, "/api/user/self", "GET");
+      let selfBody;
+      if (isAgentRouterGithubMode(platform)) {
+        const result = await callAgentRouterAccountViaTab(
+          platform,
+          (platform.baseUrl || "").trim().replace(/\/+$/, ""),
+        );
+        selfBody = result.body;
+        accountWarn = result.warning || "";
+      } else {
+        selfBody = await callApi(platform, "/api/user/self", "GET");
+      }
+      if (isAgentRouterGithubMode(platform)) verifyConfiguredUser(platform, selfBody);
       selfData = (selfBody && selfBody.data) || null;
     } catch (e) { selfErr = e && e.message ? e.message : String(e); selfData = null; }
   }
@@ -785,26 +1077,36 @@ async function fetchAccount(platform, month, reuseSelfData) {
   if (!selfData && monthlyTokens == null) {
     throw new Error("获取账户额度失败：" + (selfErr || tokenErr || "账号接口不可用"));
   }
-  const warn = tokensTruncated
-    ? "本月Token为前若干页累计估算（超出截断）"
-    : (monthlyTokens == null ? "本月Token接口不可用" : "");
+  if (!selfData && monthlyTokens != null) {
+    throw new Error("获取账户额度失败：用户接口不可用（" + (selfErr || "未返回账户额度") + "）；本月 Token 统计仍可用");
+  }
+  const warnings = [];
+  if (accountWarn) warnings.push(accountWarn);
+  if (tokensTruncated) warnings.push("本月Token为前若干页累计估算（超出截断）");
+  else if (monthlyTokens == null) warnings.push("本月Token接口不可用");
+  const quotaValue = (data, names) => {
+    if (!data) return null;
+    for (const name of names) {
+      if (data[name] != null && data[name] !== "") return data[name];
+    }
+    return null;
+  };
   return {
-    available: selfData ? selfData.quota : null,
-    used: selfData ? selfData.used_quota : null,
-    requestCount: selfData ? selfData.request_count : null,
+    available: quotaValue(selfData, ["quota", "available", "available_quota", "remaining_quota"]),
+    used: quotaValue(selfData, ["used_quota", "usedQuota", "used"]),
+    requestCount: quotaValue(selfData, ["request_count", "requestCount"]),
     monthlyTokens,
     tokensTruncated,
-    displayName: selfData ? (selfData.display_name || selfData.username) : null,
-    _warn: warn,
+    displayName: selfData ? (selfData.display_name || selfData.displayName || selfData.username) : null,
+    _warn: warnings.join("；"),
   };
 }
 
 async function runStats(platform, month) {
-  const base = (platform.baseUrl || "").trim().replace(/\/+$/, "");
-  const isCookieSelf = platform.authMode === "cookie" && (/agentrouter\.org/i.test(base) || !!platform.triggerSelf);
+  const isSelfTrigger = isSelfTriggerMode(platform);
   try {
     const body = await callCheckin(platform, "GET", month);
-    const account = await fetchAccount(platform, month || currentMonth(), isCookieSelf && body.data ? body.data : null);
+    const account = await fetchAccount(platform, month || currentMonth(), isSelfTrigger && body.data ? body.data : null);
     return { ok: true, message: body.message || "统计数据已更新", data: body.data, account };
   } catch (e) {
     try {
@@ -847,7 +1149,6 @@ async function runAutoCheckin(triggeredByUser = false, selectedPlatforms = null)
   if (!settings.autoEnabled && !triggeredByUser) return { skipped: true };
   const platforms = selectedPlatforms || await getPlatforms();
   if (!platforms.length) return { skipped: true };
-  // 并发签到：所有平台同时发起，互不等待（cookie 模式各站独立复用各自标签页，无冲突）
   const results = await Promise.all(platforms.map((p) => runCheckin(p, { reauth: true })));
   let ok = 0, already = 0, fail = 0;
   const list = [];
@@ -904,6 +1205,8 @@ function autoTimeReached(value) {
 async function findUncheckedPlatforms(platforms) {
   const results = await Promise.all(platforms.map(async (p) => {
     if (p.stats && p.stats.checked_in_today && p.statsDate === todayStr()) return null;
+    // /api/user/self 本身会触发 Agent Router 签到，不能把它当作只读预检接口调用。
+    if (isSelfTriggerMode(p)) return p;
     try {
       const body = await callCheckin(p, "GET", currentMonth());
       if (body && body.data && body.data.stats && body.data.stats.checked_in_today) return null;
