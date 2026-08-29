@@ -126,6 +126,9 @@ button,select{font:inherit;color:inherit}
 .card-top{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
 .platform-name{margin:0;font-size:14px;font-weight:700;letter-spacing:-.01em}
 .address{color:var(--faint);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px;margin-top:3px;letter-spacing:.02em}
+a.address{display:block;text-decoration:none;cursor:pointer;transition:color .15s ease}
+a.address:hover{color:var(--accent,#6ea8fe);text-decoration:underline}
+a.address:focus-visible{outline:1px solid var(--accent,#6ea8fe);outline-offset:2px;border-radius:3px}
 .badge{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:700;white-space:nowrap;background:var(--surface-2);color:var(--muted);border:1px solid var(--border-soft)}
 .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
 .badge-success{color:var(--success);background:var(--success-bg);border-color:var(--success-bd)}

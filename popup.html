@@ -106,6 +106,31 @@
     </div>
   </div>
 
+  <div class="modal" id="modelModal">
+    <div class="modal-box wide">
+      <div class="modal-head">
+        <h2 id="modelModalTitle">模型可用性与性能</h2>
+        <button class="close" id="modelCloseBtn" aria-label="关闭">×</button>
+      </div>
+      <div class="model-toolbar">
+        <input id="modelSearch" type="search" placeholder="搜索模型名称…" aria-label="搜索模型" />
+        <label class="model-range">统计范围
+          <select id="modelHours">
+            <option value="24">近 24 小时</option>
+            <option value="72">近 3 天</option>
+            <option value="168">近 7 天</option>
+          </select>
+        </label>
+        <label class="switch model-onlytraffic"><input type="checkbox" id="modelOnlyTraffic" /><span class="track"></span>仅看有指标的</label>
+        <button class="btn btn-light" id="modelReloadBtn">重新读取</button>
+      </div>
+      <div id="modelMeta" class="model-meta"></div>
+      <div id="modelTableWrap" class="model-table-wrap"></div>
+      <div id="modelDetail" class="model-detail"></div>
+      <p class="model-foot">指标由站点自身按真实流量统计（GET /api/perf-metrics），本操作全程只读，不调用模型、不消耗额度、不触发签到。</p>
+    </div>
+  </div>
+
   <div class="modal" id="deleteModal">
     <div class="modal-box small">
       <div class="modal-head"><h2>删除平台</h2><button class="close" id="deleteCloseBtn">×</button></div>

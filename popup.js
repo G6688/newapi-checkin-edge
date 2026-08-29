@@ -16,6 +16,17 @@ function currentMonth() {
 }
 const $ = (id) => document.getElementById(id);
 const esc = (v = "") => String(v).replace(/[&<>'"]/g, (c) => "&#" + c.charCodeAt(0) + ";");
+// 仅放行 http/https，避免 javascript: 等协议被写进 href
+function safeHttpUrl(v) {
+  const raw = String(v == null ? "" : v).trim();
+  if (!raw) return "";
+  try {
+    const u = new URL(raw);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.href : "";
+  } catch (e) {
+    return "";
+  }
+}
 
 function formatQuota(v) {
   return (Number(v || 0) / 500000).toFixed(4);
@@ -71,6 +82,8 @@ const getStats = (p, month) =>
 const doCheckin = (p, reauth = true) => send({ type: "checkin", platform: slim(p), reauth });
 const getAccount = (p, month) =>
   send({ type: "account", platform: slim(p), month: month || $("monthInput").value || currentMonth() });
+const getModelInsight = (p, hours) => send({ type: "modelInsight", platform: slim(p), hours });
+const getModelDetail = (p, model, hours) => send({ type: "modelDetail", platform: slim(p), model, hours });
 
 // ---------- 校验 ----------
 function validatePlatform(p) {
@@ -144,10 +157,14 @@ function render() {
       const acc = p.account || {};
       const qv = (v) => (v == null ? "—" : formatQuota(v));
       const qt = (v, trunc) => fmtTokens(v, trunc);
+      const addr = safeHttpUrl(p.baseUrl);
       return (
         '<article class="platform-card"><div class="card-top"><div>' +
         "<h3 class=\"platform-name\">" + esc(p.name) + "</h3>" +
-        '<div class="address" title="' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</div></div>" +
+        (addr
+          ? '<a class="address address-link" href="' + esc(addr) + '" target="_blank" rel="noopener noreferrer" data-action="open-site" title="在浏览器中打开 ' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</a>"
+          : '<div class="address" title="' + esc(p.baseUrl) + '">' + esc(p.baseUrl) + "</div>") +
+        "</div>" +
         '<span class="badge ' + cls + '">' + label + "</span></div>" +
         '<div class="card-stats">' +
         '<div class="mini-stat"><strong>' + qv(acc.available) + '</strong><span>可用额度</span></div>' +
@@ -158,6 +175,7 @@ function render() {
         '<div class="card-actions">' +
         '<button class="btn btn-primary" data-action="checkin" data-id="' + esc(p.id) + '"' + (p.loading ? " disabled" : "") + ">" + (p.loading ? "签到中…" : "立即签到") + "</button>" +
         '<button class="btn btn-light" data-action="stats" data-id="' + esc(p.id) + '">刷新</button>' +
+        (hasModelPanel() ? '<button class="btn btn-light" data-action="models" data-id="' + esc(p.id) + '">模型</button>' : "") +
         '<button class="btn btn-light" data-action="edit" data-id="' + esc(p.id) + '">编辑</button>' +
         '<button class="btn btn-danger" data-action="delete" data-id="' + esc(p.id) + '">删除</button>' +
         "</div></article>"
@@ -228,6 +246,223 @@ async function refreshAll() {
   } finally {
     $("refreshBtn").disabled = false;
   }
+}
+
+// ---------- 模型可用性与性能面板（只读，仅宽屏页） ----------
+// 指标来自站点自身按真实流量的采样统计，不需要调用模型，也不消耗额度。
+// 注意：success_rate 上游已是 0-100 的百分数，直接使用，不要再乘 100。
+const hasModelPanel = () => !!$("modelModal");
+let modelState = { platformId: null, hours: 24, rows: [], site: null, warnings: [], loading: false, detailModel: null };
+
+function fmtMs(v) {
+  if (v == null) return "—";
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return "—";
+  return n >= 1000 ? (n / 1000).toFixed(2) + " s" : Math.round(n) + " ms";
+}
+function fmtRate(v) {
+  return v == null ? "—" : Number(v).toFixed(2) + "%";
+}
+function fmtTps(v) {
+  return v == null || Number(v) <= 0 ? "—" : Number(v).toFixed(1);
+}
+
+// 成功率分档：上游刻度为 0-100
+function healthOf(perf) {
+  if (!perf || perf.successRate == null) return ["无指标", "badge-muted"];
+  const r = Number(perf.successRate);
+  if (r >= 99) return ["优", "badge-success"];
+  if (r >= 95) return ["良", "badge-success"];
+  if (r >= 85) return ["波动", "badge-warning"];
+  return ["异常", "badge-danger"];
+}
+
+function visibleModelRows() {
+  const kw = ($("modelSearch").value || "").trim().toLowerCase();
+  const onlyTraffic = $("modelOnlyTraffic").checked;
+  let rows = modelState.rows.slice();
+  if (kw) rows = rows.filter((r) => r.model.toLowerCase().includes(kw));
+  if (onlyTraffic) rows = rows.filter((r) => r.perf && r.perf.successRate != null);
+  // 有指标的排前面并按成功率降序；无指标的按名称排序
+  rows.sort((a, b) => {
+    const ra = a.perf && a.perf.successRate != null ? Number(a.perf.successRate) : null;
+    const rb = b.perf && b.perf.successRate != null ? Number(b.perf.successRate) : null;
+    if (ra == null && rb == null) return a.model.localeCompare(b.model);
+    if (ra == null) return 1;
+    if (rb == null) return -1;
+    return rb - ra;
+  });
+  return rows;
+}
+
+function renderModelTable() {
+  const wrap = $("modelTableWrap");
+  if (modelState.loading) {
+    wrap.innerHTML = '<div class="model-empty">正在读取模型指标…</div>';
+    return;
+  }
+  const rows = visibleModelRows();
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="model-empty">没有符合条件的模型。</div>';
+    return;
+  }
+  const body = rows
+    .map((r) => {
+      const [label, cls] = healthOf(r.perf);
+      const perf = r.perf || {};
+      const groups = (r.groups || []).join(", ");
+      return (
+        '<tr data-model="' + esc(r.model) + '"' + (modelState.detailModel === r.model ? ' class="active"' : "") + ">" +
+        '<td class="m-name"><span>' + esc(r.model) + "</span>" +
+        (r.inCatalog ? "" : '<em class="m-tag" title="站点清单未返回该模型，可能你的分组不可见">清单外</em>') +
+        "</td>" +
+        '<td class="m-status"><span class="badge ' + cls + '">' + label + "</span></td>" +
+        '<td class="m-num">' + fmtRate(perf.successRate) + "</td>" +
+        '<td class="m-num">' + fmtMs(perf.avgTtftMs) + "</td>" +
+        '<td class="m-num">' + fmtMs(perf.avgLatencyMs) + "</td>" +
+        '<td class="m-num">' + fmtTps(perf.avgTps) + "</td>" +
+        '<td class="m-groups" title="' + esc(groups) + '">' + esc(groups || "—") + "</td>" +
+        "</tr>"
+      );
+    })
+    .join("");
+  wrap.innerHTML =
+    '<table class="model-table"><thead><tr>' +
+    "<th>模型</th><th class=\"m-status\">状态</th><th class=\"m-num\">成功率</th><th class=\"m-num\">首字延迟</th>" +
+    "<th class=\"m-num\">平均耗时</th><th class=\"m-num\">TPS</th><th>可用分组</th>" +
+    "</tr></thead><tbody>" + body + "</tbody></table>" +
+    '<p class="model-tip">共 ' + rows.length + " 行 · 点击任意行查看分组明细与时段趋势</p>";
+}
+
+function renderModelMeta() {
+  const el = $("modelMeta");
+  const site = modelState.site;
+  const parts = [];
+  if (site) {
+    if (site.systemName) parts.push("站点：" + site.systemName);
+    if (site.version) parts.push("内核：" + site.version);
+    if (site.quotaPerUnit != null && site.quotaPerUnit !== 500000)
+      parts.push("⚠ quota_per_unit=" + site.quotaPerUnit + "（扩展按 500000 换算额度，此站不一致）");
+  }
+  const withPerf = modelState.rows.filter((r) => r.perf && r.perf.successRate != null).length;
+  if (modelState.rows.length) parts.push("模型 " + modelState.rows.length + " 个，其中 " + withPerf + " 个有近期指标");
+  const warn = (modelState.warnings || []).map((w) => '<span class="model-warn">' + esc(w) + "</span>").join("");
+  el.innerHTML = (parts.length ? '<span>' + parts.map(esc).join("</span><span>") + "</span>" : "") + warn;
+}
+
+async function loadModelInsight() {
+  const p = platforms.find((x) => x.id === modelState.platformId);
+  if (!p) return;
+  modelState.loading = true;
+  modelState.detailModel = null;
+  $("modelDetail").innerHTML = "";
+  renderModelTable();
+  const r = await getModelInsight(p, modelState.hours);
+  modelState.loading = false;
+  if (!r || !r.ok) {
+    modelState.rows = [];
+    modelState.site = (r && r.site) || null;
+    modelState.warnings = [];
+    renderModelMeta();
+    $("modelTableWrap").innerHTML =
+      '<div class="model-empty err">' + esc((r && r.message) || "读取失败") + "</div>";
+    return;
+  }
+  modelState.rows = r.rows || [];
+  modelState.site = r.site || null;
+  modelState.warnings = r.warnings || [];
+  renderModelMeta();
+  renderModelTable();
+}
+
+async function openModelPanel(id) {
+  if (!hasModelPanel()) return;
+  const p = platforms.find((x) => x.id === id);
+  if (!p) return;
+  modelState.platformId = id;
+  modelState.hours = Number($("modelHours").value) || 24;
+  $("modelModalTitle").textContent = "模型可用性与性能 · " + p.name;
+  $("modelSearch").value = "";
+  $("modelDetail").innerHTML = "";
+  $("modelMeta").innerHTML = "";
+  $("modelModal").classList.add("open");
+  await loadModelInsight();
+}
+
+// 只切换行高亮，不重建表格，避免滚动位置跳动
+function setActiveModelRow(model) {
+  const wrap = $("modelTableWrap");
+  if (!wrap) return;
+  wrap.querySelectorAll("tr[data-model]").forEach((tr) => {
+    tr.classList.toggle("active", tr.dataset.model === model);
+  });
+}
+
+async function showModelDetail(model) {
+  const p = platforms.find((x) => x.id === modelState.platformId);
+  if (!p) return;
+  const box = $("modelDetail");
+  // 再次点击同一行时收起明细
+  if (modelState.detailModel === model) {
+    modelState.detailModel = null;
+    setActiveModelRow(null);
+    box.innerHTML = "";
+    return;
+  }
+  modelState.detailModel = model;
+  setActiveModelRow(model);
+  box.innerHTML = '<div class="model-empty">正在读取「' + esc(model) + '」明细…</div>';
+  const r = await getModelDetail(p, model, modelState.hours);
+  // 期间用户已收起或切换到别的模型，丢弃本次结果
+  if (modelState.detailModel !== model) return;
+  if (!r || !r.ok) {
+    box.innerHTML = '<div class="model-empty err">' + esc((r && r.message) || "明细读取失败") + "</div>";
+    return;
+  }
+  if (!r.groups.length) {
+    box.innerHTML = '<div class="model-empty">「' + esc(model) + '」在近 ' + r.hours + " 小时内没有分组采样数据。</div>";
+    return;
+  }
+  const groupRows = r.groups
+    .map((g) => {
+      const [label, cls] = healthOf({ successRate: g.successRate });
+      return (
+        "<tr><td>" + esc(g.group || "default") + "</td>" +
+        '<td class="m-status"><span class="badge ' + cls + '">' + label + "</span></td>" +
+        '<td class="m-num">' + fmtRate(g.successRate) + "</td>" +
+        '<td class="m-num">' + fmtMs(g.avgTtftMs) + "</td>" +
+        '<td class="m-num">' + fmtMs(g.avgLatencyMs) + "</td>" +
+        '<td class="m-num">' + fmtTps(g.avgTps) + "</td>" +
+        '<td class="m-num">' + g.series.length + "</td></tr>"
+      );
+    })
+    .join("");
+  box.innerHTML =
+    '<h3 class="model-detail-title">' + esc(r.model) + " · 分组明细（近 " + r.hours + " 小时）</h3>" +
+    '<table class="model-table"><thead><tr>' +
+    "<th>分组</th><th class=\"m-status\">状态</th><th class=\"m-num\">成功率</th><th class=\"m-num\">首字延迟</th>" +
+    "<th class=\"m-num\">平均耗时</th><th class=\"m-num\">TPS</th><th class=\"m-num\">采样点</th>" +
+    "</tr></thead><tbody>" + groupRows + "</tbody></table>" +
+    renderSparkline(r.groups[0]);
+}
+
+// 用纯 CSS 柱状条画成功率趋势，避免引入图表库
+function renderSparkline(group) {
+  if (!group || !group.series || !group.series.length) return "";
+  const pts = group.series.slice(-24);
+  const bars = pts
+    .map((pt) => {
+      const rate = pt.success_rate == null ? null : Number(pt.success_rate);
+      const h = rate == null ? 4 : Math.max(4, Math.round(rate));
+      const cls = rate == null ? "na" : rate >= 95 ? "ok" : rate >= 85 ? "warn" : "bad";
+      const when = pt.ts ? new Date(Number(pt.ts) * 1000).toLocaleString() : "";
+      const title = when + " 成功率 " + (rate == null ? "无数据" : rate.toFixed(2) + "%") +
+        " · 延迟 " + fmtMs(pt.avg_latency_ms) + " · TPS " + fmtTps(pt.avg_tps);
+      return '<i class="' + cls + '" style="height:' + h + '%" title="' + esc(title) + '"></i>';
+    })
+    .join("");
+  return '<div class="model-spark"><span class="model-spark-label">成功率趋势（' + esc(group.group || "default") +
+    "，最近 " + pts.length + " 个时段）</span><div class=\"model-spark-bars\">" + bars + "</div></div>";
 }
 
 // ---------- 添加/编辑 ----------
@@ -439,6 +674,16 @@ async function init() {
 
   // 事件委托：所有卡片按钮统一处理
   $("platformGrid").addEventListener("click", (e) => {
+    // 站点网址：点击在浏览器新标签页打开（侧边栏里 target="_blank" 不一定生效，统一走 chrome.tabs）
+    const link = e.target.closest('a[data-action="open-site"]');
+    if (link) {
+      const url = safeHttpUrl(link.getAttribute("href"));
+      if (url) {
+        e.preventDefault();
+        chrome.tabs.create({ url });
+      }
+      return;
+    }
     const btn = e.target.closest("button[data-action]");
     if (!btn) return;
     const action = btn.dataset.action;
@@ -446,6 +691,7 @@ async function init() {
     if (action === "checkin") checkin(id);
     else if (action === "stats") fetchStats(id, btn);
     else if (action === "edit") editPlatform(id);
+    else if (action === "models") openModelPanel(id);
     else if (action === "delete") removePlatform(id);
   });
 
@@ -506,6 +752,29 @@ async function init() {
     toast("平台已删除");
   };
 
+  if (hasModelPanel()) {
+    const closeModel = () => {
+      $("modelModal").classList.remove("open");
+      modelState.detailModel = null;
+      $("modelDetail").innerHTML = "";
+    };
+    $("modelCloseBtn").onclick = closeModel;
+    $("modelModal").onclick = (e) => {
+      if (e.target === $("modelModal")) closeModel();
+    };
+    $("modelSearch").addEventListener("input", renderModelTable);
+    $("modelOnlyTraffic").onchange = renderModelTable;
+    $("modelHours").onchange = () => {
+      modelState.hours = Number($("modelHours").value) || 24;
+      loadModelInsight();
+    };
+    $("modelReloadBtn").onclick = loadModelInsight;
+    $("modelTableWrap").addEventListener("click", (e) => {
+      const tr = e.target.closest("tr[data-model]");
+      if (tr) showModelDetail(tr.dataset.model);
+    });
+  }
+
   $("batchBtn").onclick = async () => {
     if (!platforms.length) return toast("请先添加平台", true);
     $("batchBtn").disabled = true;
@@ -531,6 +800,14 @@ async function init() {
   // 「展开」：在标签页打开宽屏管理页
   $("openTabBtn").onclick = () => chrome.tabs.create({ url: chrome.runtime.getURL("popup.html") });
   if ($("themeToggle")) $("themeToggle").onclick = toggleTheme;
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    for (const mid of ["modelModal", "modal", "deleteModal"]) {
+      const el = $(mid);
+      if (el && el.classList.contains("open")) { el.classList.remove("open"); break; }
+    }
+  });
 
   $("autoEnabled").onchange = saveSettings;
   $("autoTime").onchange = saveSettings;

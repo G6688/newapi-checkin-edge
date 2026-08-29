@@ -1117,6 +1117,727 @@ async function runStats(platform, month) {
   }
 }
 
+// ---------- 模型可用性与性能指标（全部只读，不触发签到） ----------
+// 数据来自上游 NewAPI 自带接口，无需真实调用模型，也不消耗额度：
+//   GET /api/status                     -> 版本、quota_per_unit、pricing 导航模块开关
+//   GET /api/perf-metrics/summary       -> 各模型成功率/平均延迟/TPS（仅含近期有流量的模型）
+//   GET /api/perf-metrics?model=xxx     -> 单模型分组明细，含首字延迟 avg_ttft_ms 与时间序列
+//   GET /api/pricing                    -> 站点完整模型清单，用于左连接补齐"无流量"的模型
+// 注意：success_rate 上游已是 0-100 的百分数，不要再乘 100。
+const PERF_HOURS_DEFAULT = 24;
+
+// 只读 GET：保留 HTTP 状态码，便于区分"版本不支持(404)"和"令牌无效(401)"。
+// 不复用 callApiPath，避免把状态码丢进异常里，也避免影响既有签到链路。
+async function rawGetJson(p, reqPath, query) {
+  const base = (p.baseUrl || "").trim().replace(/\/+$/, "");
+  let url;
+  try {
+    url = new URL(base + reqPath);
+  } catch {
+    return { ok: false, status: 0, message: "站点地址格式不正确" };
+  }
+  if (query) for (const k of Object.keys(query)) url.searchParams.set(k, String(query[k]));
+  const headers = { "Accept": "application/json, text/plain, */*" };
+  const token = (p.accessToken || "").trim();
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const uid = String(p.userId || "").trim();
+  if (uid && /^\d+$/.test(uid)) headers["New-Api-User"] = uid;
+  let res;
+  try {
+    res = await fetch(url.toString(), { method: "GET", headers, credentials: "omit" });
+  } catch (e) {
+    return { ok: false, status: 0, message: "网络请求失败：" + (e && e.message ? e.message : "无法连接站点") };
+  }
+  const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+  let text = "";
+  try { text = await res.text(); } catch { text = ""; }
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch {}
+  if (!body) {
+    const isHtml = contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text);
+    return {
+      ok: false,
+      status: res.status,
+      message: isHtml
+        ? "站点返回了网页而非接口数据，可能被安全验证拦截（HTTP " + res.status + "）"
+        : "站点返回了无法解析的数据（HTTP " + res.status + "）",
+    };
+  }
+  if (!res.ok || body.success === false) {
+    const hint = CODE_HINTS[(body && body.code) || ""] || "";
+    return {
+      ok: false,
+      status: res.status,
+      body,
+      message: (body.message || "请求失败（HTTP " + res.status + "）") + (hint ? " ｜ " + hint : ""),
+    };
+  }
+  return { ok: true, status: res.status, body };
+}
+
+// 只有「访问令牌」模式能由 Service Worker 直连；另两种模式复用站点登录态。
+function isTokenAuthMode(p) {
+  return !p || !p.authMode || p.authMode === "token";
+}
+
+// ---- Cookie / Agent Router 模式的只读取数通道 ----
+// 新版 NewAPI 的 UserAuth() 只认 Authorization 头（middleware/auth.go 里
+// classifyDashboardCredential 第一行就读该头，取不到直接判定凭证不匹配），
+// 所以纯 Cookie 请求后台接口一律 401。POST /api/user/auth/refresh 可以用登录
+// Cookie 换取有效期 15 分钟的 access token，但它挂了 SessionCookieOriginGuard()，
+// 要求 Origin/Referer 与站点同源，Service Worker 直连会被判 403。
+// 因此这两种模式与既有签到链路一致：统一在站点标签页内同源执行。
+const SESSION_TOKEN_SKEW_MS = 60000;
+const SESSION_TOKEN_FALLBACK_MS = 10 * 60 * 1000;
+const sessionTokenCache = new Map();
+const sessionTokenInflight = new Map();
+
+// 站点页面内只读 GET：自动携带登录 Cookie，可按需附加 Authorization。
+// 独立于 tabFetchCheckin，避免为了加一个请求头而改动既有签到链路。
+function tabGetPerfJson(reqPath, query, bearer, apiUserKey, userId) {
+  return (async () => {
+    let url;
+    try {
+      url = new URL(reqPath, location.origin);
+    } catch {
+      return { status: 0, httpOk: false, netError: "接口路径不合法" };
+    }
+    if (query) for (const k of Object.keys(query)) url.searchParams.set(k, String(query[k]));
+    const headers = { "Accept": "application/json, text/plain, */*", "Cache-Control": "no-store" };
+    if (bearer) headers["Authorization"] = "Bearer " + bearer;
+    if (userId && apiUserKey) headers[apiUserKey] = String(userId);
+    let res;
+    try {
+      res = await fetch(url.toString(), { method: "GET", headers, credentials: "include" });
+    } catch (e) {
+      return { status: 0, httpOk: false, netError: "网络请求失败：" + (e && e.message ? e.message : "无法连接站点") };
+    }
+    const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+    let text = "";
+    try { text = await res.text(); } catch { text = ""; }
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch {}
+    const isHtml = contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text);
+    return { status: res.status, httpOk: res.ok, body, isHtml };
+  })();
+}
+
+// 站点页面内用登录 Cookie 换取 access token（同源发起才能过 Origin 校验）。
+function tabRefreshAuthToken() {
+  return (async () => {
+    let res;
+    try {
+      res = await fetch(new URL("/api/user/auth/refresh", location.origin).toString(), {
+        method: "POST",
+        headers: {
+          "Accept": "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        },
+        credentials: "include",
+        body: "{}",
+      });
+    } catch (e) {
+      return { status: 0, httpOk: false, netError: "网络请求失败：" + (e && e.message ? e.message : "无法连接站点") };
+    }
+    let text = "";
+    try { text = await res.text(); } catch { text = ""; }
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch {}
+    const data = body && body.data ? body.data : null;
+    return {
+      status: res.status,
+      httpOk: res.ok,
+      success: body ? body.success !== false : false,
+      token: data && data.access_token ? String(data.access_token) : "",
+      expiresAt: data && data.access_expires_at != null ? Number(data.access_expires_at) : null,
+      message: body && body.message ? String(body.message) : "",
+      code: body && body.code ? String(body.code) : "",
+    };
+  })();
+}
+
+// access_expires_at 可能是秒级或毫秒级时间戳，统一成毫秒。
+function normalizeTokenExpiry(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return Date.now() + SESSION_TOKEN_FALLBACK_MS;
+  return n < 1e12 ? n * 1000 : n;
+}
+
+function sessionTokenKey(base, userId) {
+  let origin = base;
+  try { origin = new URL(base).origin; } catch {}
+  return origin + "#" + (userId || "");
+}
+
+function readSessionToken(key) {
+  const hit = sessionTokenCache.get(key);
+  if (!hit) return "";
+  if (hit.expiresAt - Date.now() <= SESSION_TOKEN_SKEW_MS) {
+    sessionTokenCache.delete(key);
+    return "";
+  }
+  return hit.token;
+}
+
+// /api/user/auth/refresh 带 CriticalRateLimit() 且会轮换 refresh Cookie，
+// 同一站点的并发请求必须共用同一次换取结果，避免限流与刷新竞争。
+async function acquireSessionToken(tabId, key, staleToken) {
+  const cached = readSessionToken(key);
+  if (cached && cached !== staleToken) return { ok: true, token: cached };
+  const running = sessionTokenInflight.get(key);
+  if (running) return await running;
+  const task = (async () => {
+    let out;
+    try {
+      out = await chrome.scripting.executeScript({ target: { tabId }, func: tabRefreshAuthToken });
+    } catch (e) {
+      return { ok: false, message: "在站点标签页换取会话令牌失败：" + (e && e.message ? e.message : "请先在浏览器登录该站点") };
+    }
+    const r = (out && out[0] && out[0].result) || null;
+    if (!r) return { ok: false, message: "站点标签页没有返回会话令牌" };
+    if (r.netError) return { ok: false, message: r.netError };
+    if (!r.httpOk || !r.success || !r.token) {
+      sessionTokenCache.delete(key);
+      if (r.status === 404) {
+        return { ok: false, status: 404, message: "该站点没有 /api/user/auth/refresh 接口，无法用登录状态读取后台指标。" };
+      }
+      const hint = CODE_HINTS[r.code || ""] || "";
+      const detail = r.message || "HTTP " + r.status;
+      return {
+        ok: false,
+        status: r.status,
+        message: "无法用登录状态换取会话令牌（" + detail + "）" + (hint ? " ｜ " + hint : "") +
+          "，请先在浏览器中打开并登录该站点，然后重试。",
+      };
+    }
+    sessionTokenCache.set(key, { token: r.token, expiresAt: normalizeTokenExpiry(r.expiresAt) });
+    return { ok: true, token: r.token };
+  })();
+  sessionTokenInflight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    sessionTokenInflight.delete(key);
+  }
+}
+
+// 把注入结果归一化成与 rawGetJson 一致的契约：{ ok, status, body, message }
+async function injectGetJson(tabId, reqPath, query, bearer, apiUserKey, userId) {
+  let out;
+  try {
+    out = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: tabGetPerfJson,
+      args: [reqPath, query || null, bearer || null, apiUserKey || null, userId || null],
+    });
+  } catch (e) {
+    return { ok: false, status: 0, message: "在站点标签页执行请求失败：" + (e && e.message ? e.message : "请先在浏览器登录该站点") };
+  }
+  const r = (out && out[0] && out[0].result) || null;
+  if (!r) return { ok: false, status: 0, message: "站点标签页没有返回数据" };
+  if (r.netError) return { ok: false, status: r.status || 0, message: r.netError };
+  if (!r.body) {
+    return {
+      ok: false,
+      status: r.status,
+      message: r.isHtml
+        ? "站点返回了网页而非接口数据，可能是登录跳转或安全验证（HTTP " + r.status + "）"
+        : "站点返回了无法解析的数据（HTTP " + r.status + "）",
+    };
+  }
+  if (!r.httpOk || r.body.success === false) {
+    const hint = CODE_HINTS[(r.body && r.body.code) || ""] || "";
+    return {
+      ok: false,
+      status: r.status,
+      body: r.body,
+      message: (r.body.message || "请求失败（HTTP " + r.status + "）") + (hint ? " ｜ " + hint : ""),
+    };
+  }
+  return { ok: true, status: r.status, body: r.body };
+}
+
+// 复用已打开的站点标签页；没有就临时开一个后台标签页，结束后关掉。
+async function withSiteTab(base, fn) {
+  let origin;
+  try {
+    origin = new URL(base).origin;
+  } catch {
+    throw new Error("站点地址格式不正确");
+  }
+  let tab = null;
+  let createdTabId = null;
+  const tabs = await chrome.tabs.query({ url: origin + "/*" }).catch(() => []);
+  if (tabs && tabs.length) {
+    tab = tabs.find((t) => t.url && !/\/(login|signin|register)/i.test(t.url)) || tabs[0];
+  }
+  if (!tab) {
+    try {
+      tab = await chrome.tabs.create({ url: base, active: false });
+      createdTabId = tab.id;
+      await waitTabComplete(tab.id);
+    } catch (e) {
+      throw new Error("无法打开站点标签页：" + (e && e.message ? e.message : "未知错误"));
+    }
+  }
+  try {
+    return await fn(tab.id);
+  } finally {
+    if (createdTabId != null) await chrome.tabs.remove(createdTabId).catch(() => {});
+  }
+}
+
+// 取数通道：token 模式由 Service Worker 直连；Cookie / Agent Router 模式在站点
+// 标签页内同源请求。先不带 Authorization 试一次（旧内核 TryUserAuth 允许匿名读，
+// 这样对它们零副作用），只有明确 401 时才换会话令牌重试。
+async function withInsightReader(platform, fn) {
+  const base = (platform.baseUrl || "").trim().replace(/\/+$/, "");
+  if (isTokenAuthMode(platform)) {
+    return await fn((reqPath, query) => rawGetJson(platform, reqPath, query));
+  }
+  const st = cookieStrategy(platform, base);
+  const apiUserKey = st.apiUserKey || "New-Api-User";
+  const userId = String(platform.userId || "").trim();
+  const key = sessionTokenKey(base, userId);
+  return await withSiteTab(base, async (tabId) => {
+    const read = async (reqPath, query) => {
+      const bearer = readSessionToken(key);
+      const first = await injectGetJson(tabId, reqPath, query, bearer, apiUserKey, userId);
+      if (first.ok || first.status !== 401) return first;
+      const got = await acquireSessionToken(tabId, key, bearer);
+      if (!got.ok) return { ok: false, status: first.status, message: got.message || first.message };
+      if (got.token === bearer) return first;
+      return await injectGetJson(tabId, reqPath, query, got.token, apiUserKey, userId);
+    };
+    return await fn(read);
+  });
+}
+
+// 解析 /api/status 里的 pricing 导航模块：决定 perf-metrics 是否可用/是否要求登录。
+function parsePricingModule(statusData) {
+  let nav = statusData && statusData.HeaderNavModules;
+  if (typeof nav === "string") {
+    try { nav = JSON.parse(nav); } catch { nav = null; }
+  }
+  const pricing = nav && nav.pricing;
+  if (pricing == null) return { present: false, enabled: null, requireAuth: null };
+  if (typeof pricing === "boolean") return { present: true, enabled: pricing, requireAuth: null };
+  return {
+    present: true,
+    enabled: pricing.enabled !== false,
+    requireAuth: pricing.requireAuth === true,
+  };
+}
+
+function normalizePerfEntry(entry) {
+  if (!entry) return null;
+  const num = (v) => (v == null || v === "" || Number.isNaN(Number(v)) ? null : Number(v));
+  return {
+    successRate: num(entry.success_rate),
+    avgLatencyMs: num(entry.avg_latency_ms),
+    avgTps: num(entry.avg_tps),
+    avgTtftMs: num(entry.avg_ttft_ms),
+    recentSuccessRates: Array.isArray(entry.recent_success_rates)
+      ? entry.recent_success_rates.map(num).filter((v) => v != null)
+      : [],
+  };
+}
+
+// 以 /api/pricing 的完整模型清单为骨架左连接 perf 指标；
+// perf 里出现但 pricing 未返回的模型（例如你的分组看不到但站点有流量）也补进来并标记。
+function joinModelInsight(catalog, perfModels) {
+  const perfMap = new Map();
+  for (const m of perfModels) {
+    const name = String((m && m.model_name) || "").trim();
+    if (name) perfMap.set(name, m);
+  }
+  const rows = [];
+  const seen = new Set();
+  for (const item of catalog) {
+    const name = String((item && item.model_name) || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    rows.push({
+      model: name,
+      vendor: String((item && item.owner_by) || ""),
+      groups: Array.isArray(item && item.enable_groups) ? item.enable_groups : [],
+      inCatalog: true,
+      perf: normalizePerfEntry(perfMap.get(name)),
+    });
+  }
+  for (const m of perfModels) {
+    const name = String((m && m.model_name) || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    rows.push({ model: name, vendor: "", groups: [], inCatalog: false, perf: normalizePerfEntry(m) });
+  }
+  return rows;
+}
+
+// ---- 无 perf-metrics 站点的降级指标：从「我的调用日志」聚合 ----
+// 老版 new-api 分支（例如 Agent Router，/api/status 的 version 形如
+// init-2026xxxx-xxxxxxx、且没有 HeaderNavModules 字段）没有 perf_metrics 模块，
+// /api/perf-metrics 一律 404。它们的 /api/log/self 里有足够的信息可以还原
+// 成功率与延迟：type=2 是消费（成功），type=5 是错误（失败），use_time 是秒，
+// other 里的 frt 是首字毫秒。据此聚合出的是「你自己的调用表现」而非站点全局。
+const LOG_PAGE_SIZE = 100;
+const LOG_MAX_PAGES = 6;
+const LOG_TYPE_CONSUME = 2;
+const LOG_TYPE_ERROR = 5;
+
+function parseLogOther(raw) {
+  if (!raw) return null;
+  if (typeof raw === "object") return raw;
+  try { return JSON.parse(String(raw)); } catch { return null; }
+}
+
+// /api/log/self/ 返回 { success, data: { items, page, page_size, total } }
+async function fetchSelfLogs(read, hours, modelName) {
+  const endTs = Math.floor(Date.now() / 1000);
+  const startTs = endTs - Math.max(1, Number(hours) || PERF_HOURS_DEFAULT) * 3600;
+  const items = [];
+  let lastError = "";
+  for (let page = 1; page <= LOG_MAX_PAGES; page++) {
+    const query = {
+      p: page,
+      page_size: LOG_PAGE_SIZE,
+      type: 0,
+      start_timestamp: startTs,
+      end_timestamp: endTs,
+    };
+    if (modelName) query.model_name = modelName;
+    const res = await read("/api/log/self/", query);
+    if (!res.ok) {
+      lastError = res.message || "无法读取调用日志";
+      break;
+    }
+    const data = (res.body && res.body.data) || {};
+    const batch = Array.isArray(data.items) ? data.items : (Array.isArray(data) ? data : []);
+    for (const it of batch) items.push(it);
+    if (batch.length < LOG_PAGE_SIZE) break;
+  }
+  return { items, error: lastError, startTs, endTs };
+}
+
+function finishLogAccumulator(acc) {
+  const ok = acc.total - acc.fail;
+  return {
+    successRate: acc.total ? Number(((ok / acc.total) * 100).toFixed(2)) : null,
+    avgLatencyMs: acc.useTimeN ? Math.round((acc.useTimeSum / acc.useTimeN) * 1000) : null,
+    avgTtftMs: acc.frtN ? Math.round(acc.frtSum / acc.frtN) : null,
+    avgTps: acc.tokenTime > 0 ? Number((acc.tokens / acc.tokenTime).toFixed(2)) : null,
+    recentSuccessRates: [],
+    sampleCount: acc.total,
+  };
+}
+
+function newLogAccumulator() {
+  return { total: 0, fail: 0, useTimeSum: 0, useTimeN: 0, frtSum: 0, frtN: 0, tokens: 0, tokenTime: 0 };
+}
+
+function accumulateLogEntry(acc, it) {
+  const type = Number(it && it.type);
+  if (type !== LOG_TYPE_CONSUME && type !== LOG_TYPE_ERROR) return false;
+  acc.total++;
+  if (type === LOG_TYPE_ERROR) acc.fail++;
+  const use = Number(it.use_time);
+  if (Number.isFinite(use) && use > 0) {
+    acc.useTimeSum += use;
+    acc.useTimeN++;
+  }
+  const other = parseLogOther(it.other);
+  const frt = other && other.frt != null ? Number(other.frt) : null;
+  if (frt != null && Number.isFinite(frt) && frt > 0) {
+    acc.frtSum += frt;
+    acc.frtN++;
+  }
+  const completion = Number(it.completion_tokens);
+  if (type === LOG_TYPE_CONSUME && Number.isFinite(completion) && completion > 0 && Number.isFinite(use) && use > 0) {
+    acc.tokens += completion;
+    acc.tokenTime += use;
+  }
+  return true;
+}
+
+// 聚合成与 normalizePerfEntry 同构的对象，好让左连接与渲染逻辑复用。
+function aggregateLogPerf(items) {
+  const byModel = new Map();
+  for (const it of items) {
+    const name = String((it && it.model_name) || "").trim();
+    if (!name) continue;
+    let acc = byModel.get(name);
+    if (!acc) {
+      acc = newLogAccumulator();
+      byModel.set(name, acc);
+    }
+    accumulateLogEntry(acc, it);
+  }
+  const out = new Map();
+  for (const [name, acc] of byModel) {
+    if (acc.total > 0) out.set(name, finishLogAccumulator(acc));
+  }
+  return out;
+}
+
+// 按整小时分桶，产出与 perf-metrics series 同构的趋势点。
+function aggregateLogSeries(items) {
+  const buckets = new Map();
+  for (const it of items) {
+    const created = Number(it && it.created_at);
+    if (!Number.isFinite(created) || created <= 0) continue;
+    const bucket = Math.floor(created / 3600) * 3600;
+    let acc = buckets.get(bucket);
+    if (!acc) {
+      acc = newLogAccumulator();
+      buckets.set(bucket, acc);
+    }
+    accumulateLogEntry(acc, it);
+  }
+  return [...buckets.entries()]
+    .filter(([, acc]) => acc.total > 0)
+    .sort((a, b) => a[0] - b[0])
+    .map(([ts, acc]) => {
+      const done = finishLogAccumulator(acc);
+      return {
+        ts,
+        success_rate: done.successRate,
+        avg_latency_ms: done.avgLatencyMs,
+        avg_tps: done.avgTps,
+      };
+    });
+}
+
+// 用日志把清单左连接成 rows（与 joinModelInsight 结构一致）
+function joinLogInsight(catalog, logPerf) {
+  const rows = [];
+  const seen = new Set();
+  for (const item of catalog) {
+    const name = String((item && item.model_name) || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    rows.push({
+      model: name,
+      vendor: String((item && item.owner_by) || ""),
+      groups: Array.isArray(item && item.enable_groups) ? item.enable_groups : [],
+      inCatalog: true,
+      perf: logPerf.get(name) || null,
+    });
+  }
+  for (const [name, perf] of logPerf) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    rows.push({ model: name, vendor: "", groups: [], inCatalog: false, perf });
+  }
+  return rows;
+}
+
+// 站点是否可能压根没有 perf_metrics 模块：新版内核才会下发 HeaderNavModules。
+function looksLikeLegacyKernel(site) {
+  return !!site && !site.pricingModule.present;
+}
+
+function legacyKernelNote(site) {
+  const ver = site && site.version ? "（版本 " + site.version + "）" : "";
+  const kind = looksLikeLegacyKernel(site) ? "该站点是较旧的 NewAPI 分支" : "该站点";
+  return kind + ver + "没有性能指标接口，下表成功率与延迟来自你自己近期的调用日志，不代表站点全局水平。";
+}
+
+// perf-metrics 返回 404 时的降级：模型清单 + 我的调用日志聚合。
+async function buildLogFallbackInsight(read, platform, site, range, pricingRes) {
+  const catalog = (pricingRes.ok && pricingRes.body && Array.isArray(pricingRes.body.data))
+    ? pricingRes.body.data
+    : [];
+  const logs = await fetchSelfLogs(read, range, "");
+  const logPerf = aggregateLogPerf(logs.items);
+  const rows = joinLogInsight(catalog, logPerf);
+  if (!rows.length) {
+    return {
+      ok: false,
+      status: 404,
+      site,
+      hours: range,
+      message: "该站点没有性能指标接口，也读不到模型清单和调用日志" +
+        (logs.error ? "（" + logs.error + "）" : "") + "。",
+    };
+  }
+  const warnings = [legacyKernelNote(site)];
+  if (!pricingRes.ok) {
+    warnings.push("模型清单不可用（" + (pricingRes.message || "接口异常") + "），仅列出你调用过的模型。");
+  }
+  if (logs.error) {
+    warnings.push("调用日志读取不完整（" + logs.error + "）。");
+  }
+  if (!logPerf.size) {
+    warnings.push("你在近 " + range + " 小时内没有调用记录，所以只能列出模型清单，没有可用性数据。");
+  }
+  if (!isTokenAuthMode(platform)) {
+    warnings.push("指标经站点登录会话读取，需保持浏览器已登录该站点。");
+  }
+  return {
+    ok: true,
+    hours: range,
+    site,
+    metricsSource: "log",
+    catalogOk: pricingRes.ok,
+    catalogTotal: catalog.length,
+    perfTotal: logPerf.size,
+    rows,
+    warnings,
+    message: "已读取 " + rows.length + " 个模型（其中 " + logPerf.size + " 个有你的调用记录）",
+  };
+}
+
+// 单模型明细的同源降级：把日志按小时分桶，产出一条「我的调用记录」分组。
+async function buildLogFallbackDetail(read, name, range) {
+  const logs = await fetchSelfLogs(read, range, name);
+  const acc = newLogAccumulator();
+  let counted = 0;
+  for (const it of logs.items) {
+    if (accumulateLogEntry(acc, it)) counted++;
+  }
+  if (!counted) {
+    return {
+      ok: false,
+      status: 404,
+      message: "该站点没有性能指标接口，且近 " + range + " 小时内没有你对「" + name + "」的调用记录" +
+        (logs.error ? "（" + logs.error + "）" : "") + "。",
+    };
+  }
+  const done = finishLogAccumulator(acc);
+  return {
+    ok: true,
+    model: name,
+    hours: range,
+    source: "log",
+    groups: [{
+      group: "我的调用记录",
+      avgTtftMs: done.avgTtftMs,
+      avgLatencyMs: done.avgLatencyMs,
+      successRate: done.successRate,
+      avgTps: done.avgTps,
+      series: aggregateLogSeries(logs.items),
+    }],
+  };
+}
+
+async function runModelInsight(platform, hours) {
+  try {
+    validatePlatform(platform);
+  } catch (e) {
+    return { ok: false, message: e && e.message ? e.message : "平台配置无效" };
+  }
+
+  const range = Number(hours) > 0 ? Number(hours) : PERF_HOURS_DEFAULT;
+  try {
+    return await withInsightReader(platform, async (read) => {
+      const [statusRes, perfRes, pricingRes] = await Promise.all([
+        read("/api/status"),
+        read("/api/perf-metrics/summary", { hours: range }),
+        read("/api/pricing"),
+      ]);
+
+      const statusData = statusRes.ok && statusRes.body ? statusRes.body.data : null;
+      const site = {
+        version: statusData ? statusData.version || "" : "",
+        systemName: statusData ? statusData.system_name || "" : "",
+        quotaPerUnit: statusData && statusData.quota_per_unit != null ? Number(statusData.quota_per_unit) : null,
+        pricingModule: parsePricingModule(statusData),
+      };
+
+      if (!perfRes.ok) {
+        // 老版内核（例如 Agent Router）没有 perf_metrics 模块，退回日志聚合而不是直接报错
+        if (perfRes.status === 404) {
+          return await buildLogFallbackInsight(read, platform, site, range, pricingRes);
+        }
+        let message = perfRes.message || "无法读取模型性能指标";
+        if (perfRes.status === 401) {
+          message = isTokenAuthMode(platform)
+            ? "访问令牌无效或已过期：" + message
+            : "站点登录状态不可用：" + message;
+        } else if (perfRes.status === 403) {
+          message = site.pricingModule.present && site.pricingModule.enabled === false
+            ? "站点已关闭 pricing 模块，性能指标接口不对外开放。"
+            : "无权访问性能指标接口：" + message;
+        }
+        return { ok: false, status: perfRes.status, site, hours: range, message };
+      }
+
+      const perfModels = (perfRes.body && perfRes.body.data && Array.isArray(perfRes.body.data.models))
+        ? perfRes.body.data.models
+        : [];
+      const catalog = (pricingRes.ok && pricingRes.body && Array.isArray(pricingRes.body.data))
+        ? pricingRes.body.data
+        : [];
+
+      const warnings = [];
+      if (!pricingRes.ok) {
+        warnings.push("模型清单不可用（" + (pricingRes.message || "接口异常") + "），仅显示近期有流量的模型。");
+      }
+      if (!perfModels.length) {
+        warnings.push("该站点近 " + range + " 小时没有性能采样数据。");
+      }
+      if (!isTokenAuthMode(platform)) {
+        warnings.push("指标经站点登录会话读取，需保持浏览器已登录该站点。");
+      }
+
+      const rows = joinModelInsight(catalog, perfModels);
+      return {
+        ok: true,
+        hours: range,
+        site,
+        metricsSource: "perf",
+        catalogOk: pricingRes.ok,
+        catalogTotal: catalog.length,
+        perfTotal: perfModels.length,
+        rows,
+        warnings,
+        message: "已读取 " + rows.length + " 个模型（其中 " + perfModels.length + " 个有近期指标）",
+      };
+    });
+  } catch (e) {
+    return { ok: false, message: e && e.message ? e.message : "无法读取模型指标" };
+  }
+}
+
+// 单模型明细：分组维度的首字延迟与时间序列。
+async function runModelDetail(platform, model, hours) {
+  const name = String(model || "").trim();
+  if (!name) return { ok: false, message: "缺少模型名称" };
+  try {
+    validatePlatform(platform);
+  } catch (e) {
+    return { ok: false, message: e && e.message ? e.message : "平台配置无效" };
+  }
+  const range = Number(hours) > 0 ? Number(hours) : PERF_HOURS_DEFAULT;
+  try {
+    return await withInsightReader(platform, async (read) => {
+      const res = await read("/api/perf-metrics", { model: name, hours: range });
+      if (!res.ok) {
+        if (res.status === 404) return await buildLogFallbackDetail(read, name, range);
+        return { ok: false, status: res.status, message: res.message || "无法读取模型明细" };
+      }
+      const data = (res.body && res.body.data) || {};
+      const groups = Array.isArray(data.groups) ? data.groups : [];
+      return {
+        ok: true,
+        model: data.model_name || name,
+        hours: range,
+        groups: groups.map((g) => ({
+          group: String(g.group || ""),
+          avgTtftMs: g.avg_ttft_ms == null ? null : Number(g.avg_ttft_ms),
+          avgLatencyMs: g.avg_latency_ms == null ? null : Number(g.avg_latency_ms),
+          successRate: g.success_rate == null ? null : Number(g.success_rate),
+          avgTps: g.avg_tps == null ? null : Number(g.avg_tps),
+          series: Array.isArray(g.series) ? g.series : [],
+        })),
+      };
+    });
+  } catch (e) {
+    return { ok: false, message: e && e.message ? e.message : "无法读取模型明细" };
+  }
+}
+
 // 把统计/结果合并回单个 platform 对象
 function mergeStats(platform, data, message, ok) {
   const next = { ...platform };
@@ -1327,6 +2048,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } catch (e) {
           sendResponse({ ok: false, message: e && e.message ? e.message : "无法获取账户额度" });
         }
+      } else if (msg.type === "modelInsight") {
+        sendResponse(await runModelInsight(msg.platform, msg.hours));
+      } else if (msg.type === "modelDetail") {
+        sendResponse(await runModelDetail(msg.platform, msg.model, msg.hours));
       } else if (msg.type === "checkin") {
         const r = await runCheckin(msg.platform, { reauth: msg.reauth !== false });
         sendResponse(r);
